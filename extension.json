@@ -1,0 +1,13 @@
+{
+  "builtin": false,
+  "default_enabled": true,
+  "type": "extension",
+  "rocket_mode_compatible": true,
+  "name": "DQT-Manage",
+  "description": "DQT Management Tools",
+  "author": "Dang Quoc Truong (DQT)",
+  "author_profile": "",
+  "url": "",
+  "image": "",
+  "dependencies": []
+}
