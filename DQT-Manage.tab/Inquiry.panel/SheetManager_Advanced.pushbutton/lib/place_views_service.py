@@ -119,9 +119,9 @@ class PlaceViewsService(object):
             print("Error auto-arranging views: {}".format(str(e)))
             return []
     
-    def batch_place_views(self, sheets, views, mode='one_per_sheet'):
+    def batch_place_views(self, sheets, views, mode='one_per_sheet', rows=2, cols=2):
         """Batch place views on multiple sheets
-        
+
         Modes:
         - 'one_per_sheet': Place one view per sheet
         - 'all_on_each': Place all views on each sheet
@@ -129,7 +129,7 @@ class PlaceViewsService(object):
         """
         try:
             placements = []
-            
+
             if mode == 'one_per_sheet':
                 for i, sheet in enumerate(sheets):
                     if i < len(views):
@@ -140,36 +140,36 @@ class PlaceViewsService(object):
                                 'view': views[i],
                                 'viewport': viewport
                             })
-            
+
             elif mode == 'all_on_each':
                 for sheet in sheets:
                     sheet_placements = self.auto_arrange_views_on_sheet(
-                        sheet, views, rows=2, cols=2)
+                        sheet, views, rows=rows, cols=cols)
                     for viewport in sheet_placements:
                         placements.append({
                             'sheet': sheet,
                             'viewport': viewport
                         })
-            
+
             elif mode == 'distribute':
-                views_per_sheet = max(1, len(views) / len(sheets))
+                views_per_sheet = max(1, len(views) // max(1, len(sheets)))
                 view_index = 0
-                
+
                 for sheet in sheets:
                     sheet_views = views[view_index:view_index + views_per_sheet]
                     sheet_placements = self.auto_arrange_views_on_sheet(
-                        sheet, sheet_views, rows=2, cols=2)
-                    
+                        sheet, sheet_views, rows=rows, cols=cols)
+
                     for viewport in sheet_placements:
                         placements.append({
                             'sheet': sheet,
                             'viewport': viewport
                         })
-                    
+
                     view_index += views_per_sheet
-            
+
             return placements
-            
+
         except Exception as e:
             print("Error in batch place views: {}".format(str(e)))
             return []
