@@ -1,0 +1,11 @@
+title: Modify
+layout:
+  - Split
+  - Wall_Adjust Base
+  - Wall Cut Profile
+  - CadtoWall
+  - CadtoFloor
+  - RoomtoArea
+  - Autojoin
+  - Gridline
+  - Level
