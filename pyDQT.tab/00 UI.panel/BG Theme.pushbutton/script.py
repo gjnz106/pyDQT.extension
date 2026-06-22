@@ -35,7 +35,6 @@ import clr
 clr.AddReference("PresentationFramework")
 clr.AddReference("PresentationCore")
 clr.AddReference("WindowsBase")
-clr.AddReference("System.Xml")
 
 from System.IO import MemoryStream
 from System.Text import Encoding

@@ -1266,7 +1266,11 @@ class TextNoteTypeManagerWindow(Window):
     
     def _build_datatable(self, items):
         """Build a System.Data.DataTable from item list - works with WPF Binding"""
-        clr.AddReference('System.Data')
+        for _asm in ("System.Data", "System.Data.Common"):
+            try:
+                clr.AddReference(_asm)
+            except Exception:
+                pass
         from System.Data import DataTable
         
         dt = DataTable("TextNoteTypes")

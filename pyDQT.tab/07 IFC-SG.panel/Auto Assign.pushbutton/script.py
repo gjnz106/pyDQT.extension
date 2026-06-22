@@ -22,7 +22,11 @@ Supports LTA Industry Mapping Excel with USERDEFINED handling."""
 
 import clr
 clr.AddReference("System")
-clr.AddReference("System.Data")
+for _asm in ("System.Data", "System.Data.Common"):
+    try:
+        clr.AddReference(_asm)
+    except Exception:
+        pass
 clr.AddReference("System.Windows.Forms")
 clr.AddReference("PresentationCore")
 clr.AddReference("PresentationFramework")

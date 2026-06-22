@@ -32,9 +32,13 @@ clr.AddReference("PresentationFramework")
 clr.AddReference("PresentationCore")
 clr.AddReference("WindowsBase")
 clr.AddReference("System")
-clr.AddReference("System.Xml")
-clr.AddReference("System.IO.Compression")
-clr.AddReference("System.IO.Compression.FileSystem")
+for _asm in ("System.Xml", "System.Xml.ReaderWriter", "System.Xml.XmlDocument",
+             "System.Private.Xml", "System.IO.Compression",
+             "System.IO.Compression.FileSystem"):
+    try:
+        clr.AddReference(_asm)
+    except Exception:
+        pass
 
 import System
 from System.IO import MemoryStream, File, Path as IOPath, StreamReader

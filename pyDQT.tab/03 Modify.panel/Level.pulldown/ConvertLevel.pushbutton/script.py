@@ -22,7 +22,6 @@ clr.AddReference('System.Windows.Forms')
 clr.AddReference('PresentationFramework')
 clr.AddReference('PresentationCore')
 clr.AddReference('WindowsBase')
-clr.AddReference('System.Xml')
 
 import Autodesk.Revit.DB as DB
 from Autodesk.Revit.DB import Transaction, FilteredElementCollector, View, ViewType, \
@@ -39,7 +38,6 @@ from System.Windows.Controls import *
 from System.Windows.Media import SolidColorBrush, BrushConverter
 from System.Windows.Markup import XamlReader
 from System.IO import StringReader
-from System.Xml import XmlReader
 
 # =====================================================
 # REVIT CONTEXT
@@ -372,8 +370,7 @@ class LevelSwapWindow(object):
     
     def __init__(self):
         # Parse XAML
-        xml_reader = XmlReader.Create(StringReader(MAIN_XAML))
-        self.window = XamlReader.Load(xml_reader)
+        self.window = XamlReader.Parse(MAIN_XAML)
         
         # Get UI elements - Summary
         self.txt_total_levels = self.window.FindName("txtTotalLevels")
