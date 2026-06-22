@@ -20,7 +20,6 @@ clr.AddReference('PresentationCore')
 clr.AddReference('PresentationFramework')
 clr.AddReference('WindowsBase')
 clr.AddReference('System.Windows.Forms')
-clr.AddReference('System.Xml')
 
 from Autodesk.Revit.DB import *
 from Autodesk.Revit.UI import *
@@ -30,7 +29,6 @@ from System.Windows.Controls import *
 from System.Windows.Media import *
 from System.Windows.Markup import XamlReader
 from System.IO import StringReader
-from System.Xml import XmlReader
 import os
 import sys
 import json
@@ -522,8 +520,7 @@ class ExcelColumnMapper:
         self.result = None  # Will hold mapping dict if OK
         self.sheets_data = RequirementParser.read_excel_headers(filepath)
         
-        xr = XmlReader.Create(StringReader(MAPPER_XAML))
-        self.window = XamlReader.Load(xr)
+        self.window = XamlReader.Parse(MAPPER_XAML)
         
         # Get controls
         self.cmbSheet = self.window.FindName("cmbSheet")
@@ -720,8 +717,7 @@ class CategoryPickerDialog:
         self.selected_categories = []
         self._checkboxes = []
         
-        xr = XmlReader.Create(StringReader(CATPICKER_XAML))
-        self.window = XamlReader.Load(xr)
+        self.window = XamlReader.Parse(CATPICKER_XAML)
         
         self.txtPickerInfo = self.window.FindName("txtPickerInfo")
         self.spPickCategories = self.window.FindName("spPickCategories")
@@ -1341,8 +1337,7 @@ class ParamLoaderWindow:
         self._show_filter = "all"
         self._checkboxes = []  # track checkbox -> requirement index
         
-        xr = XmlReader.Create(StringReader(XAML_STR))
-        self.window = XamlReader.Load(xr)
+        self.window = XamlReader.Parse(XAML_STR)
         self._get_controls()
         self._bind_events()
     

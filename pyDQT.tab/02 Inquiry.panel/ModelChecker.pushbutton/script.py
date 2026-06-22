@@ -28,7 +28,6 @@ clr.AddReference('PresentationCore')
 clr.AddReference('PresentationFramework')
 clr.AddReference('WindowsBase')
 clr.AddReference('System.Windows.Forms')
-clr.AddReference('System.Xml')
 
 from Autodesk.Revit.DB import *
 from Autodesk.Revit.UI import *
@@ -38,7 +37,6 @@ from System.Windows.Controls import *
 from System.Windows.Media import *
 from System.Windows.Markup import XamlReader
 from System.IO import StringReader
-from System.Xml import XmlReader
 import os
 import sys
 import json
@@ -1773,8 +1771,7 @@ class ModelCheckerWindow:
         self.rule_items = []
         
         # Parse XAML
-        xr = XmlReader.Create(StringReader(XAML_STR))
-        self.window = XamlReader.Load(xr)
+        self.window = XamlReader.Parse(XAML_STR)
         
         # Get controls
         self._get_controls()

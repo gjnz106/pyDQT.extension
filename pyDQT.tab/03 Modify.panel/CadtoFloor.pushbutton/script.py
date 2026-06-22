@@ -25,7 +25,6 @@ clr.AddReference('System')
 clr.AddReference('PresentationCore')
 clr.AddReference('PresentationFramework')
 clr.AddReference('WindowsBase')
-clr.AddReference('System.Xml')
 
 # CRITICAL: Do NOT use "from Autodesk.Revit.DB import *" - conflicts with WPF Grid
 import Autodesk.Revit.DB as DB
@@ -34,7 +33,6 @@ import Autodesk.Revit.UI as RUI
 from System import EventHandler
 from System.Collections.Generic import List
 from System.IO import StringReader
-from System.Xml import XmlReader
 from System.Windows import Window, MessageBox, MessageBoxButton, MessageBoxResult, MessageBoxImage
 from System.Windows import Visibility, Thickness, HorizontalAlignment, VerticalAlignment, TextAlignment, FontWeights
 from System.Windows.Controls import *
@@ -414,9 +412,7 @@ XAML_LAYER_ITEM = """
 # ==============================================================================
 def load_xaml_from_string(xaml_string):
     """Load XAML from string"""
-    string_reader = StringReader(xaml_string)
-    xml_reader = XmlReader.Create(string_reader)
-    return XamlReader.Load(xml_reader)
+    return XamlReader.Parse(xaml_string)
 
 
 def mm_to_feet(mm):

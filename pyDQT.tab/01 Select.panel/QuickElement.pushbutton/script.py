@@ -23,7 +23,6 @@ __doc__ = "Quickly find, select, and zoom to any element in your Revit model."
 import clr
 clr.AddReference('System')
 clr.AddReference('System.Core')
-clr.AddReference('System.Xml')
 clr.AddReference('PresentationFramework')
 clr.AddReference('PresentationCore')
 clr.AddReference('WindowsBase')
@@ -33,7 +32,6 @@ clr.AddReference('RevitAPIUI')
 import System
 from System import Action
 from System.IO import StringReader
-import System.Xml
 from System.Windows import Window, WindowStartupLocation, Thickness
 from System.Windows.Controls import ListBoxItem
 from System.Windows.Markup import XamlReader
@@ -563,7 +561,7 @@ class QuickSelectWindow(Window):
     
     def __init__(self):
         # Load XAML - must load into self, not separate object
-        xr = XamlReader.Load(System.Xml.XmlReader.Create(StringReader(XAML_STR)))
+        xr = XamlReader.Parse(XAML_STR)
         
         # Copy window properties
         self.Title = xr.Title

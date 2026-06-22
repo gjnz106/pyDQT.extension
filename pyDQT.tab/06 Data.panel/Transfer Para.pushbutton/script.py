@@ -25,7 +25,6 @@ import traceback
 clr.AddReference("PresentationFramework")
 clr.AddReference("PresentationCore")
 clr.AddReference("WindowsBase")
-clr.AddReference("System.Xml")
 
 import System
 from System import IO, Text, Windows

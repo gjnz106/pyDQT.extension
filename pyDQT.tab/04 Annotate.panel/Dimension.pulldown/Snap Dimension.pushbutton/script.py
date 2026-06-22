@@ -17,8 +17,11 @@ clr.AddReference("System")
 clr.AddReference("PresentationFramework")
 clr.AddReference("PresentationCore")
 clr.AddReference("WindowsBase")
-clr.AddReference("System.Xml")
-clr.AddReference("System.Data")
+for _asm in ("System.Data", "System.Data.Common"):
+    try:
+        clr.AddReference(_asm)
+    except Exception:
+        pass
 
 from System.IO import MemoryStream
 from System.Text import Encoding

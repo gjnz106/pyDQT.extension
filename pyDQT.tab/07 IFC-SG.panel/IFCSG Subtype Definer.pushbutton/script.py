@@ -870,7 +870,11 @@ class IFCSGSubtypeWindow(object):
 
     def _populate_datagrid(self, rows):
         """Populate DataGrid using DataTable for reliable WPF binding."""
-        clr.AddReference("System.Data")
+        for _asm in ("System.Data", "System.Data.Common"):
+            try:
+                clr.AddReference(_asm)
+            except Exception:
+                pass
         from System.Data import DataTable
 
         dt = DataTable()
