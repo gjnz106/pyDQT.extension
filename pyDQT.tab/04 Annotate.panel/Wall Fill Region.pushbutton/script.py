@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Wall Fill Region v3.2 - DQT
-Creates filled region(s) in the active plan view covering the walls and/or
-columns cut by the view's cut plane. Elements can come from the host model
-AND/OR from selected linked Revit files.
+Wall Fill Region v3.3 - DQT
+Creates filled region(s) in the active plan view covering walls and/or columns,
+from the host model AND/OR linked Revit files.
 
-Footprints are taken from the real solid geometry (so they match the walls
-exactly, including joins - no overhang). Overlapping footprints are merged via
-a boolean union into as few regions as possible; if a merged outline is
-rejected, the tool falls back to one region per element so nothing is lost and
-it never crashes.
+Modes:
+- All cut elements in the current view (auto, by cut plane + crop).
+- Pick elements one by one in the host model.
+- Pick elements one by one in linked models.
+
+Footprints come from the real solid geometry (match the elements exactly, no
+overhang). Overlapping footprints are merged into as few regions as possible,
+with a per-element fallback so nothing is lost and it never crashes.
 
 Copyright (c) 2026 Dang Quoc Truong (DQT)
 All rights reserved.
@@ -20,8 +22,8 @@ License: All rights reserved - pyDQT Suite
 
 __title__ = "Wall Fill\nRegion"
 __author__ = "Dang Quoc Truong (DQT)"
-__doc__ = ("Create filled region(s) covering walls/columns cut by the active "
-           "plan view, from the host model or linked files.\n"
+__doc__ = ("Create filled region(s) covering walls/columns - all in view or "
+           "picked one by one, from host or linked files.\n"
            "Copyright (c) 2026 Dang Quoc Truong (DQT)")
 
 import clr
@@ -38,6 +40,7 @@ from Autodesk.Revit.DB import (
     ViewPlan, PlanViewPlane, ElementId, RevitLinkInstance,
     IFailuresPreprocessor, FailureProcessingResult, FailureSeverity
 )
+from Autodesk.Revit.UI.Selection import ObjectType, ISelectionFilter
 from System.Collections.Generic import List
 
 from pyrevit import forms, script
@@ -53,11 +56,14 @@ output = script.get_output()
 Z0 = 0.0
 TOL = 1e-9
 EPS_Z = 1e-4
-MIN_SEG = 0.0052      # ft (~1.6 mm) - below Revit's short-curve tolerance
-CROP_MARGIN = 0.1     # ft, tolerance around the crop box
+MIN_SEG = 0.0052
+CROP_MARGIN = 0.1
 EXTRUDE_HEIGHT = 10.0
 
-# (label, BuiltInCategory, kind)
+MODE_ALL = "All cut elements in current view"
+MODE_HOST = "Pick elements - Host model"
+MODE_LINK = "Pick elements - Linked models"
+
 CATEGORY_CHOICES = [
     ("Walls", BuiltInCategory.OST_Walls, "wall"),
     ("Columns (Architectural)", BuiltInCategory.OST_Columns, "column"),
@@ -65,9 +71,47 @@ CATEGORY_CHOICES = [
 ]
 
 
+def _kind_of(elem):
+    """Return 'wall' / 'column' for supported elements, else None."""
+    try:
+        bic = elem.Category.BuiltInCategory
+    except Exception:
+        return None
+    if bic == BuiltInCategory.OST_Walls:
+        return "wall"
+    if bic in (BuiltInCategory.OST_Columns,
+               BuiltInCategory.OST_StructuralColumns):
+        return "column"
+    return None
+
+
 # ============================================================================
-# FAILURE HANDLING - swallow sketch errors so one bad region is skipped
-# silently instead of popping a dialog or aborting everything.
+# SELECTION FILTERS
+# ============================================================================
+class _HostFilter(ISelectionFilter):
+    def AllowElement(self, e):
+        return _kind_of(e) is not None
+
+    def AllowReference(self, r, p):
+        return False
+
+
+class _LinkFilter(ISelectionFilter):
+    def AllowElement(self, e):
+        return True  # allow link instances so Revit drills into them
+
+    def AllowReference(self, r, p):
+        try:
+            link = doc.GetElement(r.ElementId)
+            ld = link.GetLinkDocument()
+            le = ld.GetElement(r.LinkedElementId)
+            return _kind_of(le) is not None
+        except Exception:
+            return False
+
+
+# ============================================================================
+# FAILURE HANDLING
 # ============================================================================
 class _SwallowErrors(IFailuresPreprocessor):
     def PreprocessFailures(self, fa):
@@ -129,8 +173,6 @@ def _iter_solids(geo):
 
 
 def _solid_footprint_loops(elem, transform):
-    """Real plan footprint (host coords) from the bottom faces of the
-    element's solids - matches the element exactly, joins included."""
     opt = Options()
     opt.DetailLevel = ViewDetailLevel.Fine
     opt.ComputeReferences = False
@@ -145,8 +187,6 @@ def _solid_footprint_loops(elem, transform):
 
 
 def _wall_rect_loops(wall, transform):
-    """Fallback footprint for walls without usable solid geometry: a plain
-    rectangle from the location curve and width (no end extension)."""
     loc = wall.Location
     if not isinstance(loc, LocationCurve):
         return []
@@ -209,8 +249,6 @@ def _footprint_loops(elem, kind, transform):
 
 
 def _loop_ok(loop):
-    """Cheap validity check to avoid sketch errors: closed, >=3 edges, no
-    sub-tolerance segment."""
     try:
         if loop.IsOpen():
             return False
@@ -227,6 +265,14 @@ def _loop_ok(loop):
     return n >= 3
 
 
+def _good_loops(elem, kind, transform):
+    try:
+        loops = _footprint_loops(elem, kind, transform)
+    except Exception:
+        loops = []
+    return [lp for lp in loops if _loop_ok(lp)]
+
+
 def _loop_to_solid(loop):
     loops = List[CurveLoop]()
     loops.Add(loop)
@@ -235,9 +281,6 @@ def _loop_to_solid(loop):
 
 
 def _merge_groups(items):
-    """Union overlapping footprint solids. Returns a list of [solid, [loops]]
-    where loops are the original footprints feeding that group (used as a
-    fallback if the merged outline is rejected)."""
     groups = []
     for solid, loop in items:
         placed = False
@@ -338,8 +381,6 @@ def _name(e):
 # REGION CREATION
 # ============================================================================
 def _create_region(frt, loops):
-    """Create one filled region from the given loops in an isolated
-    transaction. Returns True on success, False if Revit rejected it."""
     coll = List[CurveLoop]()
     for lp in loops:
         if _loop_ok(lp):
@@ -361,27 +402,73 @@ def _create_region(frt, loops):
         return False
 
 
-# ============================================================================
-# MAIN
-# ============================================================================
-def main():
-    if not isinstance(view, ViewPlan):
-        forms.alert("This tool works in plan views only (floor / structural / "
-                    "ceiling / area plan).\nOpen a plan view and try again.",
+def _build_and_create(frt, all_loops, counts, skipped):
+    """Shared pipeline: merge footprints and create the region(s)."""
+    if not all_loops:
+        forms.alert("No usable walls/columns were found for this selection.",
                     title="Wall Fill Region")
         return
+    items = []
+    for loop in all_loops:
+        try:
+            items.append((_loop_to_solid(loop), loop))
+        except Exception:
+            skipped += 1
+    groups = _merge_groups(items)
 
-    # --- 1) Choose source(s): host + loaded links ---------------------------
+    created = 0
+    tg = TransactionGroup(doc, "DQT - Wall Fill Region")
+    tg.Start()
+    for solid, orig_loops in groups:
+        merged_loops = _bottom_loops(solid)
+        if merged_loops and _create_region(frt, merged_loops):
+            created += 1
+        else:
+            for lp in orig_loops:
+                if _create_region(frt, [lp]):
+                    created += 1
+    tg.Assimilate()
+
+    if created == 0:
+        forms.alert("Could not create any filled region from the selection.",
+                    title="Wall Fill Region")
+        return
+    detail = ", ".join("{}: {}".format(k, v) for k, v in counts.items())
+    msg = "Created {} filled region(s) covering {}.".format(created, detail)
+    if skipped:
+        msg += "\n{} footprint(s) skipped.".format(skipped)
+    output.print_md("**Wall Fill Region** - {}".format(msg))
+    forms.alert(msg, title="Wall Fill Region")
+
+
+# ============================================================================
+# COLLECTORS
+# ============================================================================
+def _pick_filled_region_type():
+    frts = list(FilteredElementCollector(doc).OfClass(FilledRegionType))
+    if not frts:
+        forms.alert("No Filled Region Type found in this project.\n"
+                    "Create one (Annotate > Region) and try again.",
+                    title="Wall Fill Region")
+        return None
+    name_map = {}
+    for frt_ in frts:
+        name_map[_name(frt_)] = frt_
+    chosen = forms.SelectFromList.show(
+        sorted(name_map.keys()), title="Wall Fill Region - region type",
+        multiselect=False, button_name="Create")
+    return name_map.get(chosen) if chosen else None
+
+
+def _collect_all():
+    """All cut walls/columns in the view, from chosen sources/categories."""
     sources = [("Host model", None, None)]
     seen = {"Host model": 1}
     links = (FilteredElementCollector(doc, view.Id)
              .OfCategory(BuiltInCategory.OST_RvtLinks)
-             .WhereElementIsNotElementType()
-             .ToElements())
+             .WhereElementIsNotElementType().ToElements())
     for li in links:
-        if not isinstance(li, RevitLinkInstance):
-            continue
-        if li.GetLinkDocument() is None:
+        if not isinstance(li, RevitLinkInstance) or li.GetLinkDocument() is None:
             continue
         base = "LINK: " + _name(li)
         label = base
@@ -396,36 +483,17 @@ def main():
         [s[0] for s in sources], title="Wall Fill Region - source model(s)",
         multiselect=True, button_name="Next")
     if not picked_src:
-        return
+        return None
     chosen_sources = [s for s in sources if s[0] in picked_src]
 
-    # --- 2) Choose categories -----------------------------------------------
     picked = forms.SelectFromList.show(
         [c[0] for c in CATEGORY_CHOICES],
         title="Wall Fill Region - elements to cover",
         multiselect=True, button_name="Next")
     if not picked:
-        return
+        return None
     chosen_cats = [c for c in CATEGORY_CHOICES if c[0] in picked]
 
-    # --- 3) Choose filled region type ---------------------------------------
-    frts = list(FilteredElementCollector(doc).OfClass(FilledRegionType))
-    if not frts:
-        forms.alert("No Filled Region Type found in this project.\n"
-                    "Create one (Annotate > Region) and try again.",
-                    title="Wall Fill Region")
-        return
-    name_map = {}
-    for frt_ in frts:
-        name_map[_name(frt_)] = frt_
-    chosen_name = forms.SelectFromList.show(
-        sorted(name_map.keys()), title="Wall Fill Region - region type",
-        multiselect=False, button_name="Create")
-    if not chosen_name:
-        return
-    frt = name_map[chosen_name]
-
-    # --- 4) Collect cut elements & build footprints -------------------------
     cut_z = _cut_plane_z()
     crop = _crop_xy_bbox()
     all_loops = []
@@ -457,48 +525,82 @@ def main():
                     counts[clabel] = counts.get(clabel, 0) + 1
                 else:
                     skipped += 1
+    return all_loops, counts, skipped
 
-    if not all_loops:
-        forms.alert("No cut walls/columns were found in this view for the "
-                    "selected source(s).\n"
-                    "Check that the link is loaded and the cut plane passes "
-                    "through the elements.", title="Wall Fill Region")
-        return
 
-    # --- 5) Merge footprints, then create one region per merged group -------
-    items = []
-    for loop in all_loops:
+def _collect_picked(linked):
+    """Walls/columns picked one by one (host or linked)."""
+    otype = ObjectType.LinkedElement if linked else ObjectType.Element
+    filt = _LinkFilter() if linked else _HostFilter()
+    src = "linked models" if linked else "the host model"
+    try:
+        refs = uidoc.Selection.PickObjects(
+            otype, filt,
+            "Pick walls/columns in {} - click Finish when done".format(src))
+    except Exception:
+        return None  # user cancelled
+    if not refs:
+        return None
+
+    all_loops = []
+    counts = {}
+    skipped = 0
+    for r in refs:
         try:
-            items.append((_loop_to_solid(loop), loop))
+            if linked:
+                link = doc.GetElement(r.ElementId)
+                ld = link.GetLinkDocument()
+                elem = ld.GetElement(r.LinkedElementId)
+                transform = link.GetTotalTransform()
+            else:
+                elem = doc.GetElement(r.ElementId)
+                transform = None
         except Exception:
             skipped += 1
-    groups = _merge_groups(items)
-
-    created = 0
-    tg = TransactionGroup(doc, "DQT - Wall Fill Region")
-    tg.Start()
-    for solid, orig_loops in groups:
-        merged_loops = _bottom_loops(solid)
-        if merged_loops and _create_region(frt, merged_loops):
-            created += 1
+            continue
+        kind = _kind_of(elem)
+        if kind is None:
+            skipped += 1
+            continue
+        good = _good_loops(elem, kind, transform)
+        if good:
+            all_loops.extend(good)
+            clabel = "Walls" if kind == "wall" else "Columns"
+            counts[clabel] = counts.get(clabel, 0) + 1
         else:
-            # Merged outline rejected - fall back to the clean originals.
-            for lp in orig_loops:
-                if _create_region(frt, [lp]):
-                    created += 1
-    tg.Assimilate()
+            skipped += 1
+    return all_loops, counts, skipped
 
-    if created == 0:
-        forms.alert("Could not create any filled region from the selected "
-                    "elements.", title="Wall Fill Region")
+
+# ============================================================================
+# MAIN
+# ============================================================================
+def main():
+    if not isinstance(view, ViewPlan):
+        forms.alert("This tool works in plan views only (floor / structural / "
+                    "ceiling / area plan).\nOpen a plan view and try again.",
+                    title="Wall Fill Region")
         return
 
-    detail = ", ".join("{}: {}".format(k, v) for k, v in counts.items())
-    msg = "Created {} filled region(s) covering {}.".format(created, detail)
-    if skipped:
-        msg += "\n{} footprint(s) skipped.".format(skipped)
-    output.print_md("**Wall Fill Region** - {}".format(msg))
-    forms.alert(msg, title="Wall Fill Region")
+    mode = forms.SelectFromList.show(
+        [MODE_ALL, MODE_HOST, MODE_LINK], title="Wall Fill Region - mode",
+        multiselect=False, button_name="Next")
+    if not mode:
+        return
+
+    frt = _pick_filled_region_type()
+    if frt is None:
+        return
+
+    if mode == MODE_ALL:
+        result = _collect_all()
+    else:
+        result = _collect_picked(mode == MODE_LINK)
+    if not result:
+        return
+
+    all_loops, counts, skipped = result
+    _build_and_create(frt, all_loops, counts, skipped)
 
 
 if __name__ == "__main__":
