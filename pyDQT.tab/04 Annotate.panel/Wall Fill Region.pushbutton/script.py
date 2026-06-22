@@ -30,7 +30,7 @@ from Autodesk.Revit.DB import (
     FilteredElementCollector, BuiltInCategory, Transaction,
     XYZ, Line, Arc, CurveLoop, LocationCurve, Element,
     FilledRegion, FilledRegionType,
-    GeometryCreationUtilities, BooleanOperationsUtils, BooleanOperationType,
+    GeometryCreationUtilities, BooleanOperationsUtils, BooleanOperationsType,
     PlanarFace, Solid, GeometryInstance, Options, ViewDetailLevel,
     ViewType, ViewPlan, PlanViewPlane, ElementId
 )
@@ -209,7 +209,7 @@ def _merge_solids(solids):
         for idx in range(len(merged)):
             try:
                 merged[idx] = BooleanOperationsUtils.ExecuteBooleanOperation(
-                    merged[idx], solid, BooleanOperationType.Union)
+                    merged[idx], solid, BooleanOperationsType.Union)
                 placed = True
                 break
             except Exception:
