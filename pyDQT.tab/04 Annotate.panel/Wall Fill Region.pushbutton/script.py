@@ -1,17 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Wall Fill Region v3.0 - DQT
-Creates filled region(s) in the active plan view covering the walls and/or
-columns that are cut by the view's cut plane. Elements can come from the host
-model AND/OR from selected linked Revit files.
+Wall Fill Region v3.1 - DQT
+Creates filled regions in the active plan view covering the walls and/or
+columns cut by the view's cut plane. Elements can come from the host model
+AND/OR from selected linked Revit files.
 
-Features:
-- Pick the source(s): Host model and/or any loaded Revit link.
-- Pick which categories to cover (Walls / Architectural Columns / Structural
-  Columns).
-- Pick the Filled Region Type (pattern).
-- Only elements cut by the plan cut plane are used; for links the geometry is
-  transformed into host coordinates. Results are limited to the view crop.
+One filled region is created per element footprint (robust - every wall is
+covered). Footprints are extended at wall ends so neighbouring regions overlap
+at corners and read as a continuous mask.
 
 Copyright (c) 2026 Dang Quoc Truong (DQT)
 All rights reserved.
@@ -22,7 +18,7 @@ License: All rights reserved - pyDQT Suite
 
 __title__ = "Wall Fill\nRegion"
 __author__ = "Dang Quoc Truong (DQT)"
-__doc__ = ("Create filled region(s) covering walls/columns cut by the active "
+__doc__ = ("Create filled regions covering walls/columns cut by the active "
            "plan view, from the host model or linked files.\n"
            "Copyright (c) 2026 Dang Quoc Truong (DQT)")
 
@@ -31,12 +27,13 @@ clr.AddReference('RevitAPI')
 clr.AddReference('RevitAPIUI')
 
 from Autodesk.Revit.DB import (
-    FilteredElementCollector, BuiltInCategory, Transaction,
+    FilteredElementCollector, BuiltInCategory,
+    Transaction, TransactionGroup, TransactionStatus,
     XYZ, Line, Arc, CurveLoop, LocationCurve, Element,
     FilledRegion, FilledRegionType,
-    GeometryCreationUtilities, BooleanOperationsUtils, BooleanOperationsType,
     PlanarFace, Solid, GeometryInstance, Options, ViewDetailLevel,
-    ViewPlan, PlanViewPlane, ElementId, RevitLinkInstance
+    ViewPlan, PlanViewPlane, ElementId, RevitLinkInstance,
+    IFailuresPreprocessor, FailureProcessingResult, FailureSeverity
 )
 from System.Collections.Generic import List
 
@@ -53,8 +50,8 @@ output = script.get_output()
 Z0 = 0.0
 TOL = 1e-9
 EPS_Z = 1e-4
-CROP_MARGIN = 0.1      # ft, tolerance around the crop box
-EXTRUDE_HEIGHT = 10.0
+MIN_SEG = 0.0052      # ft (~1.6 mm) - below Revit's short-curve tolerance
+CROP_MARGIN = 0.1     # ft, tolerance around the crop box
 
 # (label, BuiltInCategory, kind)
 CATEGORY_CHOICES = [
@@ -62,6 +59,19 @@ CATEGORY_CHOICES = [
     ("Columns (Architectural)", BuiltInCategory.OST_Columns, "column"),
     ("Structural Columns", BuiltInCategory.OST_StructuralColumns, "column"),
 ]
+
+
+# ============================================================================
+# FAILURE HANDLING - swallow sketch errors so one bad element is skipped
+# silently instead of popping a dialog or aborting everything.
+# ============================================================================
+class _SwallowErrors(IFailuresPreprocessor):
+    def PreprocessFailures(self, fa):
+        fa.DeleteAllWarnings()
+        for msg in fa.GetFailureMessages():
+            if msg.GetSeverity() == FailureSeverity.Error:
+                return FailureProcessingResult.ProceedWithRollBack
+        return FailureProcessingResult.Continue
 
 
 # ============================================================================
@@ -90,7 +100,6 @@ def _flatten_curve(curve):
 
 
 def _transform_flatten_loop(loop, transform):
-    """Transform a curve loop into host coords (if transform) then flatten."""
     new_loop = CurveLoop()
     for curve in loop:
         c = curve.CreateTransformed(transform) if transform else curve
@@ -116,8 +125,6 @@ def _iter_solids(geo):
 
 
 def _wall_footprint_loops(wall, transform):
-    """Plan footprint of a wall, in host coords, built from its location curve
-    and width."""
     loc = wall.Location
     if not isinstance(loc, LocationCurve):
         return []
@@ -139,7 +146,7 @@ def _wall_footprint_loops(wall, transform):
         if direction.GetLength() <= TOL:
             return []
         direction = direction.Normalize()
-        # Extend both ends so footprints of joined walls overlap at corners.
+        # Extend both ends so neighbouring wall regions overlap at corners.
         p0 = p0 - direction.Multiply(half)
         p1 = p1 + direction.Multiply(half)
         normal = XYZ.BasisZ.CrossProduct(direction).Normalize()
@@ -199,37 +206,23 @@ def _footprint_loops(elem, kind, transform):
     return _solid_footprint_loops(elem, transform)
 
 
-def _loop_to_solid(loop):
-    loops = List[CurveLoop]()
-    loops.Add(loop)
-    return GeometryCreationUtilities.CreateExtrusionGeometry(
-        loops, XYZ.BasisZ, EXTRUDE_HEIGHT)
-
-
-def _merge_solids(solids):
-    merged = []
-    for solid in solids:
-        placed = False
-        for idx in range(len(merged)):
-            try:
-                merged[idx] = BooleanOperationsUtils.ExecuteBooleanOperation(
-                    merged[idx], solid, BooleanOperationsType.Union)
-                placed = True
-                break
-            except Exception:
-                continue
-        if not placed:
-            merged.append(solid)
-    return merged
-
-
-def _bottom_loops(solid):
-    loops = []
-    for face in solid.Faces:
-        if isinstance(face, PlanarFace) and face.FaceNormal.Z < -0.9:
-            for cl in face.GetEdgesAsCurveLoops():
-                loops.append(cl)
-    return loops
+def _loop_ok(loop):
+    """Cheap validity check to avoid sketch errors: closed, >=3 edges, no
+    sub-tolerance segment."""
+    try:
+        if loop.IsOpen():
+            return False
+    except Exception:
+        pass
+    n = 0
+    for c in loop:
+        try:
+            if c.Length < MIN_SEG:
+                return False
+        except Exception:
+            return False
+        n += 1
+    return n >= 3
 
 
 # ============================================================================
@@ -253,8 +246,6 @@ def _cut_plane_z():
 
 
 def _is_cut(elem, cut_z, transform):
-    """True if the element is cut by the host cut plane. The element bbox (in
-    its own/link coords) is mapped to host Z via the link transform."""
     if cut_z is None:
         return True
     bb = elem.get_BoundingBox(None)
@@ -273,8 +264,6 @@ def _is_cut(elem, cut_z, transform):
 
 
 def _crop_xy_bbox():
-    """Axis-aligned model-space XY bounds of the view crop, or None if the crop
-    is not active."""
     if not view.CropBoxActive:
         return None
     cb = view.CropBox
@@ -290,7 +279,6 @@ def _crop_xy_bbox():
 
 
 def _loops_in_crop(loops, crop):
-    """True if any footprint vertex falls inside the crop XY bounds."""
     if crop is None:
         return True
     minx, miny, maxx, maxy = crop
@@ -318,7 +306,7 @@ def main():
         return
 
     # --- 1) Choose source(s): host + loaded links ---------------------------
-    sources = [("Host model", None, None)]  # (label, link_instance, transform)
+    sources = [("Host model", None, None)]
     seen = {"Host model": 1}
     links = (FilteredElementCollector(doc, view.Id)
              .OfCategory(BuiltInCategory.OST_RvtLinks)
@@ -328,7 +316,7 @@ def main():
         if not isinstance(li, RevitLinkInstance):
             continue
         if li.GetLinkDocument() is None:
-            continue  # unloaded link
+            continue
         base = "LINK: " + _name(li)
         label = base
         if label in seen:
@@ -338,18 +326,17 @@ def main():
             seen[base] = 1
         sources.append((label, li, li.GetTotalTransform()))
 
-    src_labels = [s[0] for s in sources]
     picked_src = forms.SelectFromList.show(
-        src_labels, title="Wall Fill Region - source model(s)",
+        [s[0] for s in sources], title="Wall Fill Region - source model(s)",
         multiselect=True, button_name="Next")
     if not picked_src:
         return
     chosen_sources = [s for s in sources if s[0] in picked_src]
 
     # --- 2) Choose categories -----------------------------------------------
-    labels = [c[0] for c in CATEGORY_CHOICES]
     picked = forms.SelectFromList.show(
-        labels, title="Wall Fill Region - elements to cover",
+        [c[0] for c in CATEGORY_CHOICES],
+        title="Wall Fill Region - elements to cover",
         multiselect=True, button_name="Next")
     if not picked:
         return
@@ -375,7 +362,7 @@ def main():
     # --- 4) Collect cut elements & build footprints -------------------------
     cut_z = _cut_plane_z()
     crop = _crop_xy_bbox()
-    all_loops = []
+    profiles = []          # list of single CurveLoop footprints
     counts = {}
     skipped = 0
     for label, li, transform in chosen_sources:
@@ -398,62 +385,47 @@ def main():
                     loops = []
                 if not loops or not _loops_in_crop(loops, crop):
                     continue
-                all_loops.extend(loops)
-                counts[clabel] = counts.get(clabel, 0) + 1
+                good = [lp for lp in loops if _loop_ok(lp)]
+                if good:
+                    profiles.extend(good)
+                    counts[clabel] = counts.get(clabel, 0) + 1
+                else:
+                    skipped += 1
 
-    if not all_loops:
+    if not profiles:
         forms.alert("No cut walls/columns were found in this view for the "
                     "selected source(s).\n"
                     "Check that the link is loaded and the cut plane passes "
                     "through the elements.", title="Wall Fill Region")
         return
 
-    # --- 5) Merge footprints and create region(s) ---------------------------
-    solids = []
-    for loop in all_loops:
-        try:
-            solids.append(_loop_to_solid(loop))
-        except Exception:
-            skipped += 1
-    merged = _merge_solids(solids)
-
-    def _try_create(loop_list):
+    # --- 5) Create one filled region per footprint (isolated transactions) --
+    swallow = _SwallowErrors()
+    created = 0
+    tg = TransactionGroup(doc, "DQT - Wall Fill Region")
+    tg.Start()
+    for loop in profiles:
         coll = List[CurveLoop]()
-        for lp in loop_list:
-            coll.Add(lp)
-        if coll.Count == 0:
-            return False
+        coll.Add(loop)
+        t = Transaction(doc, "DQT - Fill Region")
+        t.Start()
+        opts = t.GetFailureHandlingOptions()
+        opts.SetFailuresPreprocessor(swallow)
+        opts.SetClearAfterRollback(True)
+        t.SetFailureHandlingOptions(opts)
+        ok = False
         try:
             FilledRegion.Create(doc, frt.Id, view.Id, coll)
-            return True
+            ok = (t.Commit() == TransactionStatus.Committed)
         except Exception:
-            return False
-
-    created = 0
-    t = Transaction(doc, "DQT - Wall Fill Region")
-    t.Start()
-    try:
-        for solid in merged:
-            loops = _bottom_loops(solid)
-            if not loops:
-                continue
-            if _try_create(loops):
-                created += 1
-            else:
-                for lp in loops:
-                    if _try_create([lp]):
-                        created += 1
-        if created == 0:
-            t.RollBack()
-            forms.alert("Could not create any filled region from the selected "
-                        "elements.", title="Wall Fill Region")
-            return
-        t.Commit()
-    except Exception as ex:
-        t.RollBack()
-        forms.alert("Revit refused to create the filled region:\n{}".format(ex),
-                    title="Wall Fill Region")
-        return
+            ok = False
+        if not ok:
+            if t.HasStarted() and not t.HasEnded():
+                t.RollBack()
+            skipped += 1
+        else:
+            created += 1
+    tg.Assimilate()
 
     detail = ", ".join("{}: {}".format(k, v) for k, v in counts.items())
     msg = "Created {} filled region(s) covering {}.".format(created, detail)
