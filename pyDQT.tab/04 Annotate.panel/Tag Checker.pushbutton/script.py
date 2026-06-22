@@ -34,7 +34,6 @@ clr.AddReference("System")
 clr.AddReference("PresentationFramework")
 clr.AddReference("PresentationCore")
 clr.AddReference("WindowsBase")
-clr.AddReference("System.Xml")
 
 import Autodesk.Revit.DB as DB
 from Autodesk.Revit.DB import *
