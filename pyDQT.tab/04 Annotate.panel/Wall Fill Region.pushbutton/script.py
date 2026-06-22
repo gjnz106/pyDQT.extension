@@ -136,6 +136,11 @@ def _wall_footprint_loops(wall):
         if direction.GetLength() <= TOL:
             return []
         direction = direction.Normalize()
+        # Extend both ends by half the wall width so footprints of joined
+        # walls overlap at corners/T-junctions (helps the boolean union merge
+        # them into one clean outline instead of leaving slivers).
+        p0 = p0 - direction.Multiply(half)
+        p1 = p1 + direction.Multiply(half)
         normal = XYZ.BasisZ.CrossProduct(direction).Normalize()
         offset = normal.Multiply(half)
         a, b = p0 + offset, p1 + offset
@@ -271,11 +276,10 @@ def _name(e):
 # MAIN
 # ============================================================================
 def main():
-    if view.ViewType in (ViewType.ThreeD, ViewType.Schedule,
-                          ViewType.DrawingSheet, ViewType.Undefined):
-        forms.alert("Active view does not support filled regions.\n"
-                    "Open a plan, section, elevation, callout or drafting view "
-                    "and try again.", title="Wall Fill Region")
+    if not isinstance(view, ViewPlan):
+        forms.alert("This tool works in plan views only (floor / structural / "
+                    "ceiling / area plan).\nOpen a plan view and try again.",
+                    title="Wall Fill Region")
         return
 
     # --- 1) Choose categories ------------------------------------------------
@@ -334,7 +338,7 @@ def main():
                     "this view.", title="Wall Fill Region")
         return
 
-    # --- 4) Merge footprints into one set of boundaries ---------------------
+    # --- 4) Merge footprints into solids (overlapping ones become one) ------
     solids = []
     for loop in all_loops:
         try:
@@ -343,20 +347,41 @@ def main():
             skipped += 1
     merged = _merge_solids(solids)
 
-    profile = List[CurveLoop]()
-    for solid in merged:
-        for loop in _bottom_loops(solid):
-            profile.Add(loop)
-    if profile.Count == 0:
-        forms.alert("Failed to extract boundaries from the footprints.",
-                    title="Wall Fill Region")
-        return
+    # --- 5) Create one filled region per merged group -----------------------
+    # Creating per group (instead of one combined call) keeps the boundaries
+    # of each region non-overlapping. If a group's boundary is still rejected,
+    # fall back to a region per individual loop so the tool never crashes.
+    def _try_create(loop_list):
+        coll = List[CurveLoop]()
+        for lp in loop_list:
+            coll.Add(lp)
+        if coll.Count == 0:
+            return False
+        try:
+            FilledRegion.Create(doc, frt.Id, view.Id, coll)
+            return True
+        except Exception:
+            return False
 
-    # --- 5) Create the single filled region ---------------------------------
+    created = 0
     t = Transaction(doc, "DQT - Wall Fill Region")
     t.Start()
     try:
-        FilledRegion.Create(doc, frt.Id, view.Id, profile)
+        for solid in merged:
+            loops = _bottom_loops(solid)
+            if not loops:
+                continue
+            if _try_create(loops):
+                created += 1
+            else:
+                for lp in loops:
+                    if _try_create([lp]):
+                        created += 1
+        if created == 0:
+            t.RollBack()
+            forms.alert("Could not create any filled region from the selected "
+                        "elements.", title="Wall Fill Region")
+            return
         t.Commit()
     except Exception as ex:
         t.RollBack()
@@ -365,7 +390,7 @@ def main():
         return
 
     detail = ", ".join("{}: {}".format(k, v) for k, v in counts.items())
-    msg = "Created 1 filled region ({}).".format(detail)
+    msg = "Created {} filled region(s) covering {}.".format(created, detail)
     if skipped:
         msg += "\n{} element(s) skipped (no usable footprint).".format(skipped)
     output.print_md("**Wall Fill Region** - {}".format(msg))
