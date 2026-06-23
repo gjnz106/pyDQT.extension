@@ -20,6 +20,9 @@ All rights reserved.
 __title__ = "Tag\nChecker"
 __author__ = "Dang Quoc Truong (DQT)"
 __doc__ = "Check if elements are tagged in current view. Highlight untagged elements and far-away tags."
+# Keep the IronPython engine alive so the modeless window's event handlers and
+# ExternalEvent keep working after the script returns.
+__persistentengine__ = True
 
 # ===========================================================================
 # IMPORTS
@@ -1302,8 +1305,42 @@ XAML_STR = """
 # ===========================================================================
 # WINDOW CLASS
 # ===========================================================================
+class _ZoomEventHandler(IExternalEventHandler):
+    """Runs zoom/select inside a valid Revit API context so the modeless
+    window can drive Revit without closing."""
+
+    def __init__(self):
+        self.action = None
+        self.data = None
+
+    def GetName(self):
+        return "DQT Tag Checker Zoom"
+
+    def Execute(self, uiapp):
+        try:
+            action = self.action
+            data = self.data
+            if action == "zoom_host":
+                zoom_to_host_element(data)
+            elif action == "zoom_link":
+                zoom_to_point(data)
+            elif action == "zoom_tag":
+                ids = List[ElementId]()
+                ids.Add(data)
+                uidoc.Selection.SetElementIds(ids)
+                uidoc.ShowElements(data)
+            elif action == "select":
+                ids = List[ElementId]()
+                for eid in data:
+                    ids.Add(eid)
+                uidoc.Selection.SetElementIds(ids)
+        except:
+            pass
+
+
 class TagCheckerWindow(object):
-    """Modal WPF window. Zoom = close -> zoom -> re-show loop."""
+    """Modeless WPF window. Zoom/select run via ExternalEvent so Revit stays
+    interactive (you can re-host a tag, then pick the next one)."""
 
     # Class-level state that persists across re-opens
     _shared_result = None
@@ -1313,6 +1350,10 @@ class TagCheckerWindow(object):
 
     def __init__(self):
         self._checkboxes = {}
+
+        # ExternalEvent for driving Revit (zoom/select) from the modeless window
+        self.zoom_handler = _ZoomEventHandler()
+        self.zoom_event = ExternalEvent.Create(self.zoom_handler)
 
         xbytes = Encoding.UTF8.GetBytes(XAML_STR)
         stream = MemoryStream(xbytes)
@@ -1481,14 +1522,22 @@ class TagCheckerWindow(object):
         if success > 0:
             self.btnAutoTag.IsEnabled = False
 
+    def _raise_zoom(self, action, data):
+        """Queue a zoom/select action to run in a valid API context."""
+        self.zoom_handler.action = action
+        self.zoom_handler.data = data
+        try:
+            self.zoom_event.Raise()
+        except:
+            pass
+
     # --- Select ---
     def _on_select_untagged(self, sender, args):
         r = TagCheckerWindow._shared_result
         if not r or not r.untagged_host_ids:
             WPFMessageBox.Show("No host untagged elements.", "Tag Checker")
             return
-        TagCheckerWindow._shared_close_action = "select"
-        self.window.Close()
+        self._raise_zoom("select", list(r.untagged_host_ids))
 
     # --- Reset / Clear ---
     def _on_reset_colors(self, sender, args):
@@ -1519,12 +1568,9 @@ class TagCheckerWindow(object):
         is_link = zoom[2]
 
         if is_link:
-            TagCheckerWindow._shared_close_action = "zoom_link"
-            TagCheckerWindow._shared_close_data = point
+            self._raise_zoom("zoom_link", point)
         else:
-            TagCheckerWindow._shared_close_action = "zoom_host"
-            TagCheckerWindow._shared_close_data = eid
-        self.window.Close()
+            self._raise_zoom("zoom_host", eid)
 
     def _on_far_dblclick(self, sender, args):
         r = TagCheckerWindow._shared_result
@@ -1533,9 +1579,7 @@ class TagCheckerWindow(object):
             return
 
         tag_eid = r.far_tag_zoom[idx][0]
-        TagCheckerWindow._shared_close_action = "zoom_tag"
-        TagCheckerWindow._shared_close_data = tag_eid
-        self.window.Close()
+        self._raise_zoom("zoom_tag", tag_eid)
 
     def _on_question_dblclick(self, sender, args):
         r = TagCheckerWindow._shared_result
@@ -1544,9 +1588,7 @@ class TagCheckerWindow(object):
             return
 
         tag_eid = r.question_tag_zoom[idx][0]
-        TagCheckerWindow._shared_close_action = "zoom_tag"
-        TagCheckerWindow._shared_close_data = tag_eid
-        self.window.Close()
+        self._raise_zoom("zoom_tag", tag_eid)
 
     # --- Show results ---
     def _show_results(self):
@@ -1625,11 +1667,20 @@ class TagCheckerWindow(object):
         self.btnSelect.IsEnabled = (uh > 0)
 
     def show(self):
-        self.window.ShowDialog()
+        # Own the window to Revit so it floats above the model and minimises
+        # with Revit, while staying modeless.
+        try:
+            from System.Windows.Interop import WindowInteropHelper
+            WindowInteropHelper(self.window).Owner = __revit__.MainWindowHandle
+        except:
+            pass
+        self.window.Show()
 
 
 # ===========================================================================
-# MAIN LOOP: show -> close -> action -> re-show
+# MAIN: show the modeless window. Zoom/select run via ExternalEvent so Revit
+# stays interactive - double-click a tag to zoom, re-host it in Revit, then
+# pick the next one, all without closing the window.
 # ===========================================================================
 active_view = doc.ActiveView
 vtype = str(active_view.ViewType)
@@ -1643,53 +1694,9 @@ if vtype not in [
         title="Tag Checker", exitscript=True)
 
 try:
-    keep_running = True
-    while keep_running:
-        TagCheckerWindow._shared_close_action = None
-        TagCheckerWindow._shared_close_data = None
-
-        win = TagCheckerWindow()
-        win.show()
-
-        # After dialog closes, execute deferred action
-        action = TagCheckerWindow._shared_close_action
-        data = TagCheckerWindow._shared_close_data
-
-        if action == "zoom_host":
-            zoom_to_host_element(data)
-            # Re-open
-            continue
-
-        elif action == "zoom_link":
-            zoom_to_point(data)
-            continue
-
-        elif action == "zoom_tag":
-            try:
-                ids = List[ElementId]()
-                ids.Add(data)
-                uidoc.Selection.SetElementIds(ids)
-                uidoc.ShowElements(data)
-            except:
-                pass
-            continue
-
-        elif action == "select":
-            r = TagCheckerWindow._shared_result
-            if r and r.untagged_host_ids:
-                ids = List[ElementId]()
-                for eid in r.untagged_host_ids:
-                    ids.Add(eid)
-                try:
-                    uidoc.Selection.SetElementIds(ids)
-                except:
-                    pass
-            keep_running = False
-
-        else:
-            # Normal close (X button or no action)
-            keep_running = False
-
+    # Keep a module-level reference alive for the modeless window.
+    tag_checker_window = TagCheckerWindow()
+    tag_checker_window.show()
 except Exception as ex:
     forms.alert(
         "Error: {}\n\n{}".format(str(ex), str(sys.exc_info())),
