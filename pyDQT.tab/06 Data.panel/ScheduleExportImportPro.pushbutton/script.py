@@ -618,9 +618,28 @@ def _create_xlsx_zipfile(filepath, sheets_data):
     # Collect all unique strings
     shared_strings = []
     string_index = {}
-    
+
+    def _xml_safe(s):
+        """Strip characters that are illegal in XML 1.0 (control chars other
+        than tab/LF/CR and the two non-characters). Revit text can contain
+        these and they make Excel report the file as corrupt."""
+        if s is None:
+            return ""
+        try:
+            if not isinstance(s, basestring):
+                s = str(s)
+        except:
+            s = str(s)
+        out = []
+        for ch in s:
+            o = ord(ch)
+            if (o == 0x9 or o == 0xA or o == 0xD or o >= 0x20) \
+                    and o != 0xFFFE and o != 0xFFFF:
+                out.append(ch)
+        return "".join(out)
+
     def get_string_index(s):
-        s = str(s) if s is not None else ""
+        s = _xml_safe(s)
         if s not in string_index:
             string_index[s] = len(shared_strings)
             shared_strings.append(s)
@@ -906,18 +925,25 @@ def _create_xlsx_zipfile(filepath, sheets_data):
         return to_xml_string(rels)
     
     # Write the XLSX file
+    DECL = '<?xml version="1.0" encoding="UTF-8"?>'
+
+    def _utf8(body):
+        # Always write UTF-8 bytes so the declared encoding matches the bytes
+        # (essential for Vietnamese / non-ASCII content).
+        return (DECL + body).encode('utf-8')
+
     with zipfile.ZipFile(filepath, 'w', zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr('[Content_Types].xml', '<?xml version="1.0" encoding="UTF-8"?>' + create_content_types_xml())
-        zf.writestr('_rels/.rels', '<?xml version="1.0" encoding="UTF-8"?>' + create_rels_xml())
-        zf.writestr('xl/workbook.xml', '<?xml version="1.0" encoding="UTF-8"?>' + create_workbook_xml())
-        zf.writestr('xl/_rels/workbook.xml.rels', '<?xml version="1.0" encoding="UTF-8"?>' + create_workbook_rels_xml())
-        zf.writestr('xl/sharedStrings.xml', '<?xml version="1.0" encoding="UTF-8"?>' + create_shared_strings_xml())
-        zf.writestr('xl/styles.xml', '<?xml version="1.0" encoding="UTF-8"?>' + create_styles_xml())
-        
+        zf.writestr('[Content_Types].xml', _utf8(create_content_types_xml()))
+        zf.writestr('_rels/.rels', _utf8(create_rels_xml()))
+        zf.writestr('xl/workbook.xml', _utf8(create_workbook_xml()))
+        zf.writestr('xl/_rels/workbook.xml.rels', _utf8(create_workbook_rels_xml()))
+        zf.writestr('xl/sharedStrings.xml', _utf8(create_shared_strings_xml()))
+        zf.writestr('xl/styles.xml', _utf8(create_styles_xml()))
+
         for idx, sheet_data in enumerate(sheets_data):
-            zf.writestr('xl/worksheets/sheet{}.xml'.format(idx + 1), 
-                       '<?xml version="1.0" encoding="UTF-8"?>' + create_worksheet_xml(sheet_data))
-    
+            zf.writestr('xl/worksheets/sheet{}.xml'.format(idx + 1),
+                        _utf8(create_worksheet_xml(sheet_data)))
+
     return True
 
 
