@@ -53,6 +53,12 @@ uidoc = __revit__.ActiveUIDocument
 active_view = doc.ActiveView
 output = script.get_output()
 
+# Elements selected when the tool was launched (for "selection only" mode)
+try:
+    preselected_ids = list(uidoc.Selection.GetElementIds())
+except:
+    preselected_ids = []
+
 SCRIPT_DIR = os.path.dirname(__file__)
 SETTINGS_FILE = os.path.join(SCRIPT_DIR, "autojoin_settings.json")
 
@@ -117,6 +123,25 @@ def get_elements(view, bic):
         .WhereElementIsNotElementType()
         .ToElements()
     )
+
+def get_selected_elements(bic):
+    """Pre-selected elements of the given category (for selection-only mode)."""
+    out = []
+    for eid in preselected_ids:
+        el = doc.GetElement(eid)
+        if el is None:
+            continue
+        try:
+            if el.Category is not None and el.Category.BuiltInCategory == bic:
+                out.append(el)
+        except:
+            pass
+    return out
+
+def collect(bic, use_selection):
+    if use_selection:
+        return get_selected_elements(bic)
+    return get_elements(active_view, bic)
 
 def get_bbox(elem):
     bb = elem.get_BoundingBox(active_view)
@@ -231,6 +256,7 @@ class AutoJoinWindow(Window):
         self.rules = [JoinRule(True, "Floors", "Walls")]
         self.result_rules = []
         self.mode = None
+        self.use_selection = False
         self._setup()
         self._build()
         self._load_presets_combo()
@@ -482,6 +508,17 @@ class AutoJoinWindow(Window):
         sp.HorizontalAlignment = HorizontalAlignment.Right
         sp.Margin = Thickness(16, 12, 16, 4)
 
+        self.cb_selection = CheckBox()
+        self.cb_selection.Content = "Chỉ element đã chọn ({})".format(
+            len(preselected_ids))
+        self.cb_selection.VerticalAlignment = VerticalAlignment.Center
+        self.cb_selection.Foreground = B("#444444")
+        self.cb_selection.FontFamily = FONT
+        self.cb_selection.FontSize = 12
+        self.cb_selection.IsChecked = (len(preselected_ids) > 0)
+        sp.Children.Add(self.cb_selection)
+        sp.Children.Add(self._spacer(14))
+
         btn_add = self._btn("Add Rule", 100, C_ADD_BG, C_BTN_FG)
         btn_add.Click += self._on_add_rule
         sp.Children.Add(btn_add)
@@ -650,12 +687,24 @@ class AutoJoinWindow(Window):
         self._preset_cb.Text = ""
         TaskDialog.Show("Deleted", "Setting '{}' deleted.".format(name))
 
+    def _validate_selection(self):
+        if bool(self.cb_selection.IsChecked) and not preselected_ids:
+            TaskDialog.Show("Auto Join",
+                            "Chế độ 'Chỉ element đã chọn' đang bật nhưng bạn "
+                            "chưa chọn element nào.\nHãy chọn element trước khi "
+                            "chạy, hoặc bỏ tích ô đó.")
+            return False
+        return True
+
     def _on_join(self, s, e):
         self.result_rules = [r for r in self.rules if r.enabled]
         if not self.result_rules:
             TaskDialog.Show("Auto Join",
                             "No enabled rules. Add and enable at least one.")
             return
+        if not self._validate_selection():
+            return
+        self.use_selection = bool(self.cb_selection.IsChecked)
         self.mode = self.MODE_JOIN
         self.DialogResult = True
         self.Close()
@@ -666,6 +715,9 @@ class AutoJoinWindow(Window):
             TaskDialog.Show("Auto Unjoin",
                             "No enabled rules. Add and enable at least one.")
             return
+        if not self._validate_selection():
+            return
+        self.use_selection = bool(self.cb_selection.IsChecked)
         self.mode = self.MODE_UNJOIN
         self.DialogResult = True
         self.Close()
@@ -675,9 +727,12 @@ class AutoJoinWindow(Window):
 # JOIN LOGIC
 # ==========================================================================
 
-def run_auto_join(rules):
+def run_auto_join(rules, use_selection=False):
     output.print_md("# Auto Join Elements")
     output.print_md("**View:** " + active_view.Name)
+    if use_selection:
+        output.print_md("**Scope:** Selected elements only ({})".format(
+            len(preselected_ids)))
     output.print_md("---")
 
     t_joined = 0
@@ -693,8 +748,8 @@ def run_auto_join(rules):
                 output.print_md("*Rule {}: Invalid category, skipped.*".format(ri + 1))
                 continue
 
-            elems_a = get_elements(active_view, bic_a)
-            elems_b = get_elements(active_view, bic_b)
+            elems_a = collect(bic_a, use_selection)
+            elems_b = collect(bic_b, use_selection)
 
             if not elems_a or not elems_b:
                 output.print_md("**Rule {}:** {} -> {} | No elements found".format(
@@ -754,9 +809,12 @@ def run_auto_join(rules):
 # UNJOIN LOGIC
 # ==========================================================================
 
-def run_auto_unjoin(rules):
+def run_auto_unjoin(rules, use_selection=False):
     output.print_md("# Auto Unjoin Elements")
     output.print_md("**View:** " + active_view.Name)
+    if use_selection:
+        output.print_md("**Scope:** Selected elements only ({})".format(
+            len(preselected_ids)))
     output.print_md("---")
 
     t_unjoined = 0
@@ -770,8 +828,8 @@ def run_auto_unjoin(rules):
                 output.print_md("*Rule {}: Invalid category, skipped.*".format(ri + 1))
                 continue
 
-            elems_a = get_elements(active_view, bic_a)
-            elems_b = get_elements(active_view, bic_b)
+            elems_a = collect(bic_a, use_selection)
+            elems_b = collect(bic_b, use_selection)
 
             if not elems_a or not elems_b:
                 output.print_md("**Rule {}:** {} x {} | No elements found".format(
@@ -815,9 +873,9 @@ def main():
 
     if result and win.result_rules:
         if win.mode == AutoJoinWindow.MODE_JOIN:
-            run_auto_join(win.result_rules)
+            run_auto_join(win.result_rules, win.use_selection)
         elif win.mode == AutoJoinWindow.MODE_UNJOIN:
-            run_auto_unjoin(win.result_rules)
+            run_auto_unjoin(win.result_rules, win.use_selection)
     else:
         output.print_md("*Cancelled.*")
 
