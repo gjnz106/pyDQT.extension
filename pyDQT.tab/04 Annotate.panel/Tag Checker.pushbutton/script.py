@@ -1306,36 +1306,115 @@ XAML_STR = """
 # WINDOW CLASS
 # ===========================================================================
 class _ZoomEventHandler(IExternalEventHandler):
-    """Runs zoom/select inside a valid Revit API context so the modeless
-    window can drive Revit without closing."""
+    """Runs every model-touching action (check/highlight/auto-tag/reset/clear
+    and zoom/select) inside a valid Revit API context, so the modeless window
+    never starts a transaction outside an API context (which crashes Revit).
+    Execute runs on Revit's main thread - the same thread that owns the WPF
+    window - so it can also refresh the UI directly."""
 
     def __init__(self):
         self.action = None
         self.data = None
+        self.params = {}
+        self.win = None
 
     def GetName(self):
-        return "DQT Tag Checker Zoom"
+        return "DQT Tag Checker"
 
     def Execute(self, uiapp):
         try:
-            action = self.action
-            data = self.data
-            if action == "zoom_host":
-                zoom_to_host_element(data)
-            elif action == "zoom_link":
-                zoom_to_point(data)
-            elif action == "zoom_tag":
-                ids = List[ElementId]()
-                ids.Add(data)
-                uidoc.Selection.SetElementIds(ids)
-                uidoc.ShowElements(data)
-            elif action == "select":
-                ids = List[ElementId]()
-                for eid in data:
-                    ids.Add(eid)
-                uidoc.Selection.SetElementIds(ids)
+            self._run()
         except:
             pass
+
+    def _run(self):
+        action = self.action
+        if action == "zoom_host":
+            zoom_to_host_element(self.data)
+        elif action == "zoom_link":
+            zoom_to_point(self.data)
+        elif action == "zoom_tag":
+            ids = List[ElementId]()
+            ids.Add(self.data)
+            uidoc.Selection.SetElementIds(ids)
+            uidoc.ShowElements(self.data)
+        elif action == "select":
+            ids = List[ElementId]()
+            for eid in self.data:
+                ids.Add(eid)
+            uidoc.Selection.SetElementIds(ids)
+        elif action == "check":
+            self._do_check()
+        elif action == "autotag":
+            self._do_autotag()
+        elif action == "reset":
+            r = TagCheckerWindow._shared_result
+            if r:
+                reset_colors(r)
+        elif action == "clearall":
+            self._do_clearall()
+
+    def _do_check(self):
+        global link_instances_cache
+        win = self.win
+        selected = self.params.get("selected", [])
+        include_links = self.params.get("include_links", False)
+        max_dist = self.params.get("max_dist", 3000.0)
+
+        if TagCheckerWindow._shared_result:
+            clear_all(TagCheckerWindow._shared_result)
+            TagCheckerWindow._shared_result = None
+
+        link_instances_cache = {}
+        if include_links:
+            try:
+                av = doc.ActiveView
+                for li in FilteredElementCollector(doc, av.Id) \
+                        .OfClass(RevitLinkInstance).WhereElementIsNotElementType():
+                    li_int = _eid_int(li.Id)
+                    try:
+                        ldoc = li.GetLinkDocument()
+                        if ldoc:
+                            link_instances_cache[li_int] = (
+                                li, ldoc, li.GetTotalTransform())
+                    except:
+                        continue
+            except:
+                pass
+
+        TagCheckerWindow._shared_result = check_tags_in_view(
+            selected, include_links, max_dist)
+        apply_highlight(TagCheckerWindow._shared_result)
+        if win:
+            win._show_results()
+
+    def _do_autotag(self):
+        win = self.win
+        r = TagCheckerWindow._shared_result
+        if not r:
+            return
+        success, fail = auto_tag_untagged(r)
+        msg = "Auto-tagged {} elements.".format(success)
+        if fail > 0:
+            msg += "\n{} failed (no tag family loaded).".format(fail)
+        if win:
+            win.tbTagResult.Text = msg
+            win.tbTagResult.Visibility = Visibility.Visible
+            if success > 0:
+                win.btnAutoTag.IsEnabled = False
+
+    def _do_clearall(self):
+        win = self.win
+        r = TagCheckerWindow._shared_result
+        if r:
+            clear_all(r)
+        TagCheckerWindow._shared_result = None
+        if win:
+            win.borderResults.Visibility = Visibility.Collapsed
+            win.tbTagResult.Visibility = Visibility.Collapsed
+            win.btnAutoTag.IsEnabled = False
+            win.btnSelect.IsEnabled = False
+
 
 
 class TagCheckerWindow(object):
@@ -1353,6 +1432,7 @@ class TagCheckerWindow(object):
 
         # ExternalEvent for driving Revit (zoom/select) from the modeless window
         self.zoom_handler = _ZoomEventHandler()
+        self.zoom_handler.win = self
         self.zoom_event = ExternalEvent.Create(self.zoom_handler)
 
         xbytes = Encoding.UTF8.GetBytes(XAML_STR)
@@ -1466,41 +1546,12 @@ class TagCheckerWindow(object):
         except:
             max_dist = 3000.0
 
-        include_links = bool(self.cbIncludeLinks.IsChecked)
-
-        # Clear previous
-        if TagCheckerWindow._shared_result:
-            clear_all(TagCheckerWindow._shared_result)
-            TagCheckerWindow._shared_result = None
-
-        # Populate link cache
-        global link_instances_cache
-        link_instances_cache = {}
-        if include_links:
-            try:
-                active_view = doc.ActiveView
-                for li in FilteredElementCollector(doc, active_view.Id) \
-                        .OfClass(RevitLinkInstance).WhereElementIsNotElementType():
-                    li_int = _eid_int(li.Id)
-                    try:
-                        ldoc = li.GetLinkDocument()
-                        if ldoc:
-                            ltf = li.GetTotalTransform()
-                            link_instances_cache[li_int] = (li, ldoc, ltf)
-                    except:
-                        continue
-            except:
-                pass
-
-        # Run check
-        TagCheckerWindow._shared_result = check_tags_in_view(
-            selected, include_links, max_dist)
-
-        # Highlight
-        apply_highlight(TagCheckerWindow._shared_result)
-
-        # Show
-        self._show_results()
+        self.zoom_handler.params = {
+            "selected": selected,
+            "include_links": bool(self.cbIncludeLinks.IsChecked),
+            "max_dist": max_dist,
+        }
+        self._raise("check")
 
     # --- Auto tag ---
     def _on_auto_tag(self, sender, args):
@@ -1511,19 +1562,10 @@ class TagCheckerWindow(object):
         if n == 0:
             WPFMessageBox.Show("No untagged elements.", "Tag Checker")
             return
+        self._raise("autotag")
 
-        success, fail = auto_tag_untagged(r)
-
-        msg = "Auto-tagged {} elements.".format(success)
-        if fail > 0:
-            msg += "\n{} failed (no tag family loaded).".format(fail)
-        self.tbTagResult.Text = msg
-        self.tbTagResult.Visibility = Visibility.Visible
-        if success > 0:
-            self.btnAutoTag.IsEnabled = False
-
-    def _raise_zoom(self, action, data):
-        """Queue a zoom/select action to run in a valid API context."""
+    def _raise(self, action, data=None):
+        """Queue an action to run in a valid Revit API context."""
         self.zoom_handler.action = action
         self.zoom_handler.data = data
         try:
@@ -1537,23 +1579,15 @@ class TagCheckerWindow(object):
         if not r or not r.untagged_host_ids:
             WPFMessageBox.Show("No host untagged elements.", "Tag Checker")
             return
-        self._raise_zoom("select", list(r.untagged_host_ids))
+        self._raise("select", list(r.untagged_host_ids))
 
     # --- Reset / Clear ---
     def _on_reset_colors(self, sender, args):
-        r = TagCheckerWindow._shared_result
-        if r:
-            reset_colors(r)
+        if TagCheckerWindow._shared_result:
+            self._raise("reset")
 
     def _on_clear_all(self, sender, args):
-        r = TagCheckerWindow._shared_result
-        if r:
-            clear_all(r)
-        TagCheckerWindow._shared_result = None
-        self.borderResults.Visibility = Visibility.Collapsed
-        self.tbTagResult.Visibility = Visibility.Collapsed
-        self.btnAutoTag.IsEnabled = False
-        self.btnSelect.IsEnabled = False
+        self._raise("clearall")
 
     # --- Double-click zoom ---
     def _on_untagged_dblclick(self, sender, args):
@@ -1568,9 +1602,9 @@ class TagCheckerWindow(object):
         is_link = zoom[2]
 
         if is_link:
-            self._raise_zoom("zoom_link", point)
+            self._raise("zoom_link", point)
         else:
-            self._raise_zoom("zoom_host", eid)
+            self._raise("zoom_host", eid)
 
     def _on_far_dblclick(self, sender, args):
         r = TagCheckerWindow._shared_result
@@ -1579,7 +1613,7 @@ class TagCheckerWindow(object):
             return
 
         tag_eid = r.far_tag_zoom[idx][0]
-        self._raise_zoom("zoom_tag", tag_eid)
+        self._raise("zoom_tag", tag_eid)
 
     def _on_question_dblclick(self, sender, args):
         r = TagCheckerWindow._shared_result
@@ -1588,7 +1622,7 @@ class TagCheckerWindow(object):
             return
 
         tag_eid = r.question_tag_zoom[idx][0]
-        self._raise_zoom("zoom_tag", tag_eid)
+        self._raise("zoom_tag", tag_eid)
 
     # --- Show results ---
     def _show_results(self):
