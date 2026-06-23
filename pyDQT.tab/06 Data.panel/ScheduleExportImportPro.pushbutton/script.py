@@ -938,6 +938,12 @@ def _create_xlsx_zipfile(filepath, sheets_data):
         return (DECL + body).encode('utf-8')
 
     with zipfile.ZipFile(filepath, 'w', zipfile.ZIP_DEFLATED) as zf:
+        # Build the worksheets FIRST: creating them appends strings (e.g. the
+        # "Element ID" header) to shared_strings. sharedStrings.xml must be
+        # generated AFTER that, otherwise it is missing strings the cells refer
+        # to by index and Excel drops them ("We found a problem with content").
+        sheet_xmls = [create_worksheet_xml(sd) for sd in sheets_data]
+
         zf.writestr('[Content_Types].xml', _utf8(create_content_types_xml()))
         zf.writestr('_rels/.rels', _utf8(create_rels_xml()))
         zf.writestr('xl/workbook.xml', _utf8(create_workbook_xml()))
@@ -945,9 +951,8 @@ def _create_xlsx_zipfile(filepath, sheets_data):
         zf.writestr('xl/sharedStrings.xml', _utf8(create_shared_strings_xml()))
         zf.writestr('xl/styles.xml', _utf8(create_styles_xml()))
 
-        for idx, sheet_data in enumerate(sheets_data):
-            zf.writestr('xl/worksheets/sheet{}.xml'.format(idx + 1),
-                        _utf8(create_worksheet_xml(sheet_data)))
+        for idx, body in enumerate(sheet_xmls):
+            zf.writestr('xl/worksheets/sheet{}.xml'.format(idx + 1), _utf8(body))
 
     return True
 
