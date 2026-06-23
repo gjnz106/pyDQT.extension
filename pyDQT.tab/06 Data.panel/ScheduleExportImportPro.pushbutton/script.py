@@ -751,7 +751,12 @@ def _create_xlsx_zipfile(filepath, sheets_data):
         if is_header and not color_tuple:
             return 1  # Default bold header style
         if color_tuple and color_tuple in color_to_fill_id:
-            return 1 + color_to_fill_id[color_tuple]  # +1 for the header style offset
+            # color_to_fill_id[color] already equals this color's index in
+            # cellXfs (0=normal, 1=header, custom colors start at 2), so it is
+            # returned as-is. (Previously this added 1, producing a style index
+            # past the end of cellXfs -> Excel dropped the cell: "Removed
+            # Records: Cell information".)
+            return color_to_fill_id[color_tuple]
         return 0  # Normal style
     
     # Create workbook XML
