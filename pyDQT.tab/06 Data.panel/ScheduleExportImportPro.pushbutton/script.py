@@ -91,6 +91,27 @@ def get_element_id_value(eid):
         except:
             return -1
 
+
+def make_element_id(val):
+    """Build an ElementId from an int, compatible across Revit versions.
+
+    In Revit 2024+ the id is 64-bit and IronPython may fail to bind a Python
+    int to the ElementId(long) constructor, so fall back to System.Int64.
+    Returns None on failure.
+    """
+    try:
+        v = int(val)
+    except:
+        return None
+    try:
+        return ElementId(v)
+    except:
+        try:
+            from System import Int64
+            return ElementId(Int64(v))
+        except:
+            return None
+
 # =============================================================================
 # CONSTANTS
 # =============================================================================
@@ -1640,14 +1661,16 @@ class ModelUpdater:
                 
                 elem = None
                 elem_id = ch.get('element_id')
-                if elem_id:
+                eid_obj = make_element_id(elem_id) if elem_id else None
+                if eid_obj is not None:
                     try:
-                        elem = doc.GetElement(ElementId(elem_id))
+                        elem = doc.GetElement(eid_obj)
                     except:
-                        pass
-                
+                        elem = None
+
                 if not elem:
                     skipped += 1
+                    log_update("SKIP: element ID {} not found".format(elem_id))
                     continue
                 
                 ok, err = ModelUpdater._set_param(elem, ch)
