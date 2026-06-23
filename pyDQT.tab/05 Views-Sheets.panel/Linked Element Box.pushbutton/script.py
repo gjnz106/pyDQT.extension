@@ -1,56 +1,107 @@
 # -*- coding: utf-8 -*-
+"""
+Linked Element Box - DQT
+Pick an element in a linked model and frame it with a section box in a 3D view.
+
+The section box is applied to a 3D view that belongs to the CURRENT user
+("DQT Link Box - <username>"), created on first use. This avoids every user
+fighting over one shared "{3D}" view (which causes worksharing ownership
+conflicts).
+"""
 from pyrevit import revit, DB, UI
 from pyrevit.revit import Transaction
 
 uidoc = revit.uidoc
 doc = revit.doc
 
+
+def _user_view_name():
+    return "DQT Link Box - {}".format(doc.Application.Username)
+
+
+def _find_user_view(name):
+    for v in DB.FilteredElementCollector(doc).OfClass(DB.View3D):
+        if v.IsTemplate:
+            continue
+        try:
+            if v.Name == name:
+                return v
+        except:
+            pass
+    return None
+
+
+def _first_3d_view_type():
+    for t in DB.FilteredElementCollector(doc).OfClass(DB.ViewFamilyType):
+        if t.ViewFamily == DB.ViewFamily.ThreeDimensional:
+            return t
+    return None
+
+
 try:
-    # Bước 1: Chọn đối tượng trong Linked Model
-    linked_ref = uidoc.Selection.PickObject(UI.Selection.ObjectType.LinkedElement, "Chọn đối tượng trong Linked Model")
+    # Step 1: pick an element inside a linked model
+    linked_ref = uidoc.Selection.PickObject(
+        UI.Selection.ObjectType.LinkedElement,
+        "Chọn đối tượng trong Linked Model")
     link_instance = doc.GetElement(linked_ref.ElementId)
 
-    # Kiểm tra xem có phải là RevitLinkInstance không
-    if isinstance(link_instance, DB.RevitLinkInstance):
-        # Bước 2: Lấy document của Linked Model
+    if not isinstance(link_instance, DB.RevitLinkInstance):
+        UI.TaskDialog.Show("Lỗi", "Đối tượng được chọn không phải là RevitLinkInstance.")
+    else:
         link_doc = link_instance.GetLinkDocument()
         linked_element = link_doc.GetElement(linked_ref.LinkedElementId)
 
-        # Bước 3: Lấy bounding box của đối tượng trong linked
         bbox = linked_element.get_BoundingBox(None)
-        if bbox:
-            # Bước 4: Chuyển bounding box sang tọa độ của model chính
-            transform = link_instance.GetTransform()
-            min_pt = transform.OfPoint(bbox.Min)
-            max_pt = transform.OfPoint(bbox.Max)
-
-            # Mở rộng thêm 500mm (0.5m) mỗi hướng
-            offset = DB.XYZ(0.5, 0.5, 0.5)
-            bbox_transformed = DB.BoundingBoxXYZ()
-            bbox_transformed.Min = min_pt - offset
-            bbox_transformed.Max = max_pt + offset
-
-            # Bước 5: Tìm View 3D mặc định (tên là "{3D}")
-            default_3d_view = None
-            views_3d = DB.FilteredElementCollector(doc).OfClass(DB.View3D).ToElements()
-            for v in views_3d:
-                if not v.IsTemplate and v.Name.strip() == "{3D}":
-                    default_3d_view = v
-                    break
-
-            if default_3d_view:
-                with Transaction("Gán Selection Box vào View 3D mặc định"):
-                    default_3d_view.SetSectionBox(bbox_transformed)
-
-                # Chuyển sang View mới sau khi Transaction đã đóng
-                uidoc.ActiveView = default_3d_view
-                UI.TaskDialog.Show("Thành công", "Đã gán Selection Box mở rộng 500mm vào View 3D mặc định.")
-            else:
-                UI.TaskDialog.Show("Lỗi", "Không tìm thấy View 3D mặc định có tên '{3D}'.")
-        else:
+        if not bbox:
             UI.TaskDialog.Show("Lỗi", "Không thể lấy BoundingBox của đối tượng.")
-    else:
-        UI.TaskDialog.Show("Lỗi", "Đối tượng được chọn không phải là RevitLinkInstance.")
+        else:
+            # Step 2: transform all 8 corners to host coords so a rotated link
+            # still yields a valid axis-aligned box.
+            transform = link_instance.GetTotalTransform()
+            pts = []
+            for ix in (bbox.Min.X, bbox.Max.X):
+                for iy in (bbox.Min.Y, bbox.Max.Y):
+                    for iz in (bbox.Min.Z, bbox.Max.Z):
+                        pts.append(transform.OfPoint(DB.XYZ(ix, iy, iz)))
+            xs = [p.X for p in pts]
+            ys = [p.Y for p in pts]
+            zs = [p.Z for p in pts]
+            off = 0.5  # ~150 mm padding each side
+            bbox_transformed = DB.BoundingBoxXYZ()
+            bbox_transformed.Min = DB.XYZ(min(xs) - off, min(ys) - off, min(zs) - off)
+            bbox_transformed.Max = DB.XYZ(max(xs) + off, max(ys) + off, max(zs) + off)
+
+            # Step 3: get this user's own 3D view (create on first use)
+            view_name = _user_view_name()
+            target_view = _find_user_view(view_name)
+            created = False
+
+            with Transaction("DQT - Link Box (per-user 3D view)"):
+                if target_view is None:
+                    vft = _first_3d_view_type()
+                    if vft is None:
+                        raise Exception("Không tìm thấy View Family Type 3D.")
+                    target_view = DB.View3D.CreateIsometric(doc, vft.Id)
+                    created = True
+                    try:
+                        target_view.Name = view_name
+                    except:
+                        pass  # keep default name if it clashes
+                target_view.SetSectionBox(bbox_transformed)
+                try:
+                    target_view.IsSectionBoxActive = True
+                except:
+                    pass
+
+            # Activate after the transaction is closed
+            uidoc.ActiveView = target_view
+
+            msg = "Đã gán Section Box vào view 3D riêng của bạn:\n{}".format(
+                target_view.Name)
+            if created:
+                msg += "\n(View mới được tạo cho user: {})".format(
+                    doc.Application.Username)
+            UI.TaskDialog.Show("Thành công", msg)
 
 except Exception as e:
     UI.TaskDialog.Show("Lỗi", "Không thể thực hiện: {}".format(str(e)))
