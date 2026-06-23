@@ -767,9 +767,13 @@ def _create_xlsx_zipfile(filepath, sheets_data):
             name = sheet_data.get('sheet_name', 'Sheet{}'.format(idx + 1))[:31]
             name = name.replace('/', '_').replace('\\', '_').replace('*', '_')
             name = name.replace('?', '_').replace('[', '_').replace(']', '_')
-            ET.SubElement(sheets_el, 'sheet', {
-                'name': name, 'sheetId': str(idx + 1), 'r:id': 'rId{}'.format(idx + 1)
-            })
+            attrs = {
+                'name': name, 'sheetId': str(idx + 1),
+                'r:id': 'rId{}'.format(idx + 1)
+            }
+            if name == "_Meta":
+                attrs['state'] = 'hidden'
+            ET.SubElement(sheets_el, 'sheet', attrs)
         return to_xml_string(wb)
     
     # Create worksheet XML with formatting
@@ -1082,7 +1086,33 @@ class ExcelManager:
                     'from_cells': data.get('from_cells', False) or from_cells
                 }
                 sheets.append(sheet_data)
-            
+
+            # Append a hidden _Meta sheet so the file can be re-imported.
+            # Layout matches _import_zipfile: B1=schedule_name, B2=field_count,
+            # then rows from 4 -> A=name, B=param_id, C=can_edit. Built from the
+            # first schedule (the data sheet the importer reads).
+            if schedules_data and not from_cells \
+                    and not schedules_data[0].get('from_cells', False):
+                first = schedules_data[0]
+                fields = first.get('fields')
+                if not fields:
+                    fields = [{'name': h, 'param_id': None, 'can_edit': False}
+                              for h in first.get('headers', [])]
+                meta_rows = [["", str(len(fields))], []]
+                for f in fields:
+                    pid = f.get('param_id')
+                    meta_rows.append([
+                        f.get('name', ''),
+                        str(pid) if pid not in (None, "") else "",
+                        "1" if f.get('can_edit') else "0",
+                    ])
+                sheets.append({
+                    'sheet_name': '_Meta',
+                    'headers': ["", first.get('schedule_name', '')],
+                    'rows': meta_rows,
+                    'from_cells': True,
+                })
+
             _create_xlsx_zipfile(filepath, sheets)
             return True, None
         except Exception as e:
