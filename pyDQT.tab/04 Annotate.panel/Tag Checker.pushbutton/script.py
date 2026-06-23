@@ -534,6 +534,26 @@ class TagCheckerResult(object):
 # ===========================================================================
 # CHECK TAGS
 # ===========================================================================
+def _drawn_in_view(elem, view):
+    """True only if the element is actually drawn in the view.
+
+    FilteredElementCollector(doc, viewId) also returns elements that are
+    hidden in the view (Hide in View > Elements) or otherwise not drawn, which
+    made the tool report them as untagged and fail to zoom to them. An element
+    is treated as drawn only when it is not hidden AND has a view-specific
+    bounding box.
+    """
+    try:
+        if elem.IsHidden(view):
+            return False
+    except:
+        pass
+    try:
+        return elem.get_BoundingBox(view) is not None
+    except:
+        return True
+
+
 def check_tags_in_view(category_names, include_links, max_distance_mm):
     result = TagCheckerResult()
     active_view = doc.ActiveView
@@ -639,6 +659,8 @@ def check_tags_in_view(category_names, include_links, max_distance_mm):
         try:
             for elem in FilteredElementCollector(doc, active_view.Id) \
                     .OfCategory(bic).WhereElementIsNotElementType():
+                if not _drawn_in_view(elem, active_view):
+                    continue
                 e = _eid_int(elem.Id)
                 if e > 0:
                     host_elements[e] = elem
