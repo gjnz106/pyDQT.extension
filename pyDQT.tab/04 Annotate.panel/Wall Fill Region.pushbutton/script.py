@@ -402,12 +402,13 @@ def _create_region(frt, loops):
         return False
 
 
-def _build_and_create(frt, all_loops, counts, skipped):
-    """Shared pipeline: merge footprints and create the region(s)."""
+def _build_and_create(frt, all_loops, counts, skipped, announce=True):
+    """Shared pipeline: merge footprints and create the region(s).
+    Returns the number of filled regions created."""
     if not all_loops:
         forms.alert("No usable walls/columns were found for this selection.",
                     title="Wall Fill Region")
-        return
+        return 0
     items = []
     for loop in all_loops:
         try:
@@ -432,13 +433,15 @@ def _build_and_create(frt, all_loops, counts, skipped):
     if created == 0:
         forms.alert("Could not create any filled region from the selection.",
                     title="Wall Fill Region")
-        return
+        return 0
     detail = ", ".join("{}: {}".format(k, v) for k, v in counts.items())
     msg = "Created {} filled region(s) covering {}.".format(created, detail)
     if skipped:
         msg += "\n{} footprint(s) skipped.".format(skipped)
     output.print_md("**Wall Fill Region** - {}".format(msg))
-    forms.alert(msg, title="Wall Fill Region")
+    if announce:
+        forms.alert(msg, title="Wall Fill Region")
+    return created
 
 
 # ============================================================================
@@ -594,13 +597,27 @@ def main():
 
     if mode == MODE_ALL:
         result = _collect_all()
-    else:
-        result = _collect_picked(mode == MODE_LINK)
-    if not result:
+        if not result:
+            return
+        all_loops, counts, skipped = result
+        _build_and_create(frt, all_loops, counts, skipped)
         return
 
-    all_loops, counts, skipped = result
-    _build_and_create(frt, all_loops, counts, skipped)
+    # Pick modes: keep picking batches until the user stops.
+    linked = (mode == MODE_LINK)
+    total = 0
+    while True:
+        result = _collect_picked(linked)
+        if not result:
+            break
+        all_loops, counts, skipped = result
+        total += _build_and_create(frt, all_loops, counts, skipped,
+                                   announce=False) or 0
+        if not forms.alert(
+                "Created {} filled region(s) so far.\n"
+                "Pick more elements?".format(total),
+                title="Wall Fill Region", yes=True, no=True):
+            break
 
 
 if __name__ == "__main__":
