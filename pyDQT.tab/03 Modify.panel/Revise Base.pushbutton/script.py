@@ -148,24 +148,15 @@ def adjust_element_base_constraint(elem, new_level):
         new_level_elevation = get_level_elevation(new_level)
         new_offset = actual_elevation - new_level_elevation
 
-        # Beam (Structural Framing): change the Reference Level and compensate
-        # BOTH end offsets so the beam keeps its absolute position (and stays
-        # level / same slope).
+        # Beam (Structural Framing): only change the Reference Level. Keep the
+        # Start/End Level Offset and z Offset Value unchanged, so the beam
+        # "jumps" to follow the new level.
         if is_beam(elem):
             ref_param = elem.get_Parameter(BuiltInParameter.INSTANCE_REFERENCE_LEVEL_PARAM)
-            end0 = elem.get_Parameter(BuiltInParameter.STRUCTURAL_BEAM_END0_ELEVATION)
-            end1 = elem.get_Parameter(BuiltInParameter.STRUCTURAL_BEAM_END1_ELEVATION)
             if not ref_param or ref_param.IsReadOnly:
                 print("Beam reference level not editable: {}".format(elem.Id))
                 return False
-            delta = get_level_elevation(current_level) - new_level_elevation
-            o0 = end0.AsDouble() if end0 else 0.0
-            o1 = end1.AsDouble() if end1 else 0.0
             ref_param.Set(new_level.Id)
-            if end0 and not end0.IsReadOnly:
-                end0.Set(o0 + delta)
-            if end1 and not end1.IsReadOnly:
-                end1.Set(o1 + delta)
             return True
 
         # Get parameters based on element type
