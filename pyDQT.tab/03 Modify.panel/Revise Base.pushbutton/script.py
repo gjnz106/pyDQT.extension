@@ -1,23 +1,24 @@
 # -*- coding: utf-8 -*-
-"""Auto Adjust Base Offset
-Automatically adjusts Base Offset when changing Base Constraint to maintain element position.
+"""Revise Base
+Change the base level / reference level of many elements at once and keep their
+position by compensating the offset.
 Supports: Walls, Floors, Columns, Structural Columns, Beams, Structural Framing
 
 Copyright (c) 2025 by Dang Quoc Truong (DQT)
 """
 
-__title__ = "Auto Adjust\nBase Offset"
+__title__ = "Revise\nBase"
 __author__ = "DQT"
-__doc__ = """Automatically adjusts Base Offset when changing Base Constraint
-to maintain element position and height.
+__doc__ = """Change the base/reference level of selected elements and keep their
+absolute position by adjusting the offset automatically.
 
 Supports: Walls, Floors, Columns, Structural Columns, Beams, Structural Framing
 
 Usage:
-1. Select elements to adjust
+1. Select elements to revise
 2. Run this tool
-3. Select new Base Constraint from levels list
-4. Tool will automatically calculate and update Base Offset
+3. Select the new base/reference level
+4. The tool updates the level and compensates the offset
 
 Copyright (c) 2025 by Dang Quoc Truong (DQT)"""
 
@@ -43,38 +44,26 @@ def get_level_elevation(level):
     """Get level elevation in project units"""
     return level.Elevation
 
+def _cat_bic(elem):
+    """Return the element's BuiltInCategory (version-safe). Avoids
+    category.Id.IntegerValue, which was removed in Revit 2026."""
+    try:
+        return elem.Category.BuiltInCategory
+    except:
+        return None
+
 def is_column(elem):
     """Check if element is a column (Architectural or Structural)"""
     if not isinstance(elem, FamilyInstance):
         return False
-    
-    try:
-        category = elem.Category
-        if not category:
-            return False
-        
-        cat_id = category.Id.IntegerValue
-        # Check if it's Structural Columns or Columns category
-        return (cat_id == BuiltInCategory.OST_StructuralColumns.value__ or 
-                cat_id == BuiltInCategory.OST_Columns.value__)
-    except:
-        return False
+    return _cat_bic(elem) in (BuiltInCategory.OST_StructuralColumns,
+                              BuiltInCategory.OST_Columns)
 
 def is_beam(elem):
     """Check if element is a beam or structural framing"""
     if not isinstance(elem, FamilyInstance):
         return False
-    
-    try:
-        category = elem.Category
-        if not category:
-            return False
-        
-        cat_id = category.Id.IntegerValue
-        # Check if it's Structural Framing category
-        return cat_id == BuiltInCategory.OST_StructuralFraming.value__
-    except:
-        return False
+    return _cat_bic(elem) == BuiltInCategory.OST_StructuralFraming
 
 def get_element_type_name(elem):
     """Get element type name safely"""
@@ -150,15 +139,35 @@ def adjust_element_base_constraint(elem, new_level):
     try:
         # Get current base information
         current_level, current_offset, actual_elevation = get_element_base_info(elem)
-        
+
         if current_level is None or actual_elevation is None:
             print("Cannot get current element information: {}".format(elem.Id))
             return False
-        
+
         # Calculate new offset needed
         new_level_elevation = get_level_elevation(new_level)
         new_offset = actual_elevation - new_level_elevation
-        
+
+        # Beam (Structural Framing): change the Reference Level and compensate
+        # BOTH end offsets so the beam keeps its absolute position (and stays
+        # level / same slope).
+        if is_beam(elem):
+            ref_param = elem.get_Parameter(BuiltInParameter.INSTANCE_REFERENCE_LEVEL_PARAM)
+            end0 = elem.get_Parameter(BuiltInParameter.STRUCTURAL_BEAM_END0_ELEVATION)
+            end1 = elem.get_Parameter(BuiltInParameter.STRUCTURAL_BEAM_END1_ELEVATION)
+            if not ref_param or ref_param.IsReadOnly:
+                print("Beam reference level not editable: {}".format(elem.Id))
+                return False
+            delta = get_level_elevation(current_level) - new_level_elevation
+            o0 = end0.AsDouble() if end0 else 0.0
+            o1 = end1.AsDouble() if end1 else 0.0
+            ref_param.Set(new_level.Id)
+            if end0 and not end0.IsReadOnly:
+                end0.Set(o0 + delta)
+            if end1 and not end1.IsReadOnly:
+                end1.Set(o1 + delta)
+            return True
+
         # Get parameters based on element type
         base_constraint_param = None
         base_offset_param = None
@@ -274,7 +283,7 @@ def main():
         success_count = 0
         error_count = 0
         
-        t = Transaction(doc, "Auto Adjust Base Constraint and Offset")
+        t = Transaction(doc, "Revise Base - Change Level & Offset")
         t.Start()
         
         try:
