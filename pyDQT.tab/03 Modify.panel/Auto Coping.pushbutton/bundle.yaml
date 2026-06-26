@@ -1,2 +1,2 @@
 title: "Auto\nCoping"
-tooltip: "Batch apply or remove coping on steel beams where they frame into girders/columns. Select beams, then run."
+tooltip: "Batch coping for steel beams: pick the beams to be CUT first, then the CUTTING girders/columns (like Revit Apply Coping). Also Remove mode."
