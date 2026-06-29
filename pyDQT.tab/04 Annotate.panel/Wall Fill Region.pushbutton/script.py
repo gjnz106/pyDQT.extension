@@ -37,6 +37,7 @@ from Autodesk.Revit.DB import (
     FilledRegion, FilledRegionType,
     GeometryCreationUtilities, BooleanOperationsUtils, BooleanOperationsType,
     PlanarFace, Solid, GeometryInstance, Options, ViewDetailLevel,
+    ExtrusionAnalyzer, Plane,
     ViewPlan, PlanViewPlane, ElementId, RevitLinkInstance,
     IFailuresPreprocessor, FailureProcessingResult, FailureSeverity,
     GraphicsStyleType
@@ -259,6 +260,28 @@ def _wall_rect_loops(wall, transform):
     return []
 
 
+def _projected_footprint_loops(elem, transform):
+    """Vertical projection (plan silhouette) of the element's solids using
+    ExtrusionAnalyzer. Gives the true plan outline even for rotated or slanted
+    columns, unlike the bottom face (offset for slanted) or the axis-aligned
+    bounding box."""
+    opt = Options()
+    opt.DetailLevel = ViewDetailLevel.Fine
+    opt.ComputeReferences = False
+    geo = elem.get_Geometry(opt)
+    plane = Plane.CreateByNormalAndOrigin(XYZ.BasisZ, XYZ.Zero)
+    loops = []
+    for solid in _iter_solids(geo):
+        try:
+            ea = ExtrusionAnalyzer.Create(solid, plane, XYZ.BasisZ)
+            face = ea.GetExtrusionBase()
+            for cl in face.GetEdgesAsCurveLoops():
+                loops.append(_transform_flatten_loop(cl, transform))
+        except Exception:
+            continue
+    return loops
+
+
 def _bbox_rect_loops(elem, transform):
     """Last-resort footprint: an axis-aligned rectangle from the element's
     bounding box (used for columns whose solid face is too complex)."""
@@ -369,29 +392,34 @@ def _clean_loop(loop):
     return cl
 
 
-def _good_loops(elem, kind, transform):
-    # 1) Real solid footprint (matches the element incl. joins).
+def _filtered(fn, elem, transform):
     try:
-        loops = [lp for lp in _solid_footprint_loops(elem, transform)
-                 if _loop_ok(lp)]
-    except Exception:
-        loops = []
-    if loops:
-        return loops
-    # 2) Walls: clean location-curve rectangle (handles mitred joins).
-    if kind == "wall":
-        try:
-            rect = [lp for lp in _wall_rect_loops(elem, transform)
-                    if _loop_ok(lp)]
-            if rect:
-                return rect
-        except Exception:
-            pass
-    # 3) Last resort (columns, odd walls): bounding-box rectangle.
-    try:
-        return [lp for lp in _bbox_rect_loops(elem, transform) if _loop_ok(lp)]
+        return [lp for lp in fn(elem, transform) if _loop_ok(lp)]
     except Exception:
         return []
+
+
+def _good_loops(elem, kind, transform):
+    if kind == "wall":
+        # Real solid footprint (incl. mitred joins) -> clean rectangle.
+        loops = _filtered(_solid_footprint_loops, elem, transform)
+        if loops:
+            return loops
+        loops = _filtered(_wall_rect_loops, elem, transform)
+        if loops:
+            return loops
+    else:
+        # Columns: vertical projection first - aligns with rotated/slanted
+        # columns (the bottom face is offset for slanted ones). Then the solid
+        # bottom face as a secondary.
+        loops = _filtered(_projected_footprint_loops, elem, transform)
+        if loops:
+            return loops
+        loops = _filtered(_solid_footprint_loops, elem, transform)
+        if loops:
+            return loops
+    # Last resort: axis-aligned bounding-box rectangle.
+    return _filtered(_bbox_rect_loops, elem, transform)
 
 
 def _loop_to_solid(loop):
