@@ -38,7 +38,8 @@ from Autodesk.Revit.DB import (
     GeometryCreationUtilities, BooleanOperationsUtils, BooleanOperationsType,
     PlanarFace, Solid, GeometryInstance, Options, ViewDetailLevel,
     ViewPlan, PlanViewPlane, ElementId, RevitLinkInstance,
-    IFailuresPreprocessor, FailureProcessingResult, FailureSeverity
+    IFailuresPreprocessor, FailureProcessingResult, FailureSeverity,
+    GraphicsStyleType
 )
 from Autodesk.Revit.UI.Selection import ObjectType, ISelectionFilter
 from System.Collections.Generic import List
@@ -318,6 +319,56 @@ def _loop_ok(loop):
     return n >= 3
 
 
+def _clean_loop(loop):
+    """Merge collinear vertices and drop sub-tolerance segments from a line
+    loop so the merged outline (with tiny mitred edges at wall joins) becomes a
+    valid filled-region boundary. Loops with arcs are returned unchanged."""
+    try:
+        curves = list(loop)
+    except Exception:
+        return loop
+    if not curves or not all(isinstance(c, Line) for c in curves):
+        return loop
+    pts = [c.GetEndPoint(0) for c in curves]
+    dedup = []
+    for p in pts:
+        if dedup and dedup[-1].DistanceTo(p) <= MIN_SEG:
+            continue
+        dedup.append(p)
+    while len(dedup) >= 2 and dedup[0].DistanceTo(dedup[-1]) <= MIN_SEG:
+        dedup.pop()
+    if len(dedup) < 3:
+        return None
+    changed = True
+    while changed and len(dedup) >= 3:
+        changed = False
+        m = len(dedup)
+        keep = []
+        for i in range(m):
+            prev = dedup[(i - 1) % m]
+            cur = dedup[i]
+            nxt = dedup[(i + 1) % m]
+            v1 = cur - prev
+            v2 = nxt - cur
+            if v1.GetLength() > TOL and v2.GetLength() > TOL and \
+                    v1.Normalize().IsAlmostEqualTo(v2.Normalize()):
+                changed = True
+                continue
+            keep.append(cur)
+        dedup = keep
+    if len(dedup) < 3:
+        return None
+    cl = CurveLoop()
+    m = len(dedup)
+    for i in range(m):
+        a = dedup[i]
+        b = dedup[(i + 1) % m]
+        if a.DistanceTo(b) <= MIN_SEG:
+            return None
+        cl.Append(Line.CreateBound(a, b))
+    return cl
+
+
 def _good_loops(elem, kind, transform):
     # 1) Real solid footprint (matches the element incl. joins).
     try:
@@ -464,7 +515,7 @@ def _name(e):
 # ============================================================================
 # REGION CREATION
 # ============================================================================
-def _create_region(frt, loops):
+def _create_region(frt, loops, line_style_id=None):
     coll = List[CurveLoop]()
     for lp in loops:
         if _loop_ok(lp):
@@ -478,7 +529,12 @@ def _create_region(frt, loops):
     opts.SetClearAfterRollback(True)
     t.SetFailureHandlingOptions(opts)
     try:
-        FilledRegion.Create(doc, frt.Id, view.Id, coll)
+        region = FilledRegion.Create(doc, frt.Id, view.Id, coll)
+        if line_style_id is not None and region is not None:
+            try:
+                region.SetLineStyleId(line_style_id)
+            except Exception:
+                pass
         return t.Commit() == TransactionStatus.Committed
     except Exception:
         if t.HasStarted() and not t.HasEnded():
@@ -486,7 +542,8 @@ def _create_region(frt, loops):
         return False
 
 
-def _build_and_create(frt, all_loops, counts, skipped, announce=True):
+def _build_and_create(frt, all_loops, counts, skipped, announce=True,
+                      line_style_id=None):
     """Shared pipeline: merge footprints and create the region(s).
     Returns the number of filled regions created."""
     if not all_loops:
@@ -501,10 +558,16 @@ def _build_and_create(frt, all_loops, counts, skipped, announce=True):
             skipped += 1
     groups = _merge_groups(items)
 
-    # Collect the merged outline of every group.
+    # Collect the merged outline of every group, cleaned so the tiny mitred
+    # edges at wall joins do not make the boundary invalid (which would force
+    # the per-element fallback and produce many fragmented regions).
     group_loops = []
     for solid, orig_loops in groups:
-        bl = [lp for lp in _bottom_loops(solid) if _loop_ok(lp)]
+        bl = []
+        for lp in _bottom_loops(solid):
+            c = _clean_loop(lp)
+            if c is not None and _loop_ok(c):
+                bl.append(c)
         group_loops.append((bl, orig_loops))
 
     created = 0
@@ -515,17 +578,17 @@ def _build_and_create(frt, all_loops, counts, skipped, announce=True):
     combined = []
     for bl, _orig in group_loops:
         combined.extend(bl)
-    if combined and _create_region(frt, combined):
+    if combined and _create_region(frt, combined, line_style_id):
         created = 1
     else:
         # Fallback: one region per group, then per original loop, so nothing
         # is lost if a combined boundary is rejected.
         for bl, orig_loops in group_loops:
-            if bl and _create_region(frt, bl):
+            if bl and _create_region(frt, bl, line_style_id):
                 created += 1
             else:
                 for lp in orig_loops:
-                    if _create_region(frt, [lp]):
+                    if _create_region(frt, [lp], line_style_id):
                         created += 1
     tg.Assimilate()
 
@@ -558,8 +621,37 @@ def _pick_filled_region_type():
         name_map[_name(frt_)] = frt_
     chosen = forms.SelectFromList.show(
         sorted(name_map.keys()), title="Wall Fill Region - region type",
-        multiselect=False, button_name="Create")
+        multiselect=False, button_name="Next")
     return name_map.get(chosen) if chosen else None
+
+
+DEFAULT_LINE = "<Default (region type)>"
+
+
+def _pick_line_style():
+    """Let the user pick a boundary line style. Returns its ElementId, or None
+    to keep the region type's default."""
+    styles = {}
+    try:
+        lines_cat = doc.Settings.Categories.get_Item(BuiltInCategory.OST_Lines)
+        for sub in lines_cat.SubCategories:
+            try:
+                gs = sub.GetGraphicsStyle(GraphicsStyleType.Projection)
+                if gs is not None:
+                    styles[sub.Name] = gs.Id
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if not styles:
+        return None
+    chosen = forms.SelectFromList.show(
+        [DEFAULT_LINE] + sorted(styles.keys()),
+        title="Wall Fill Region - boundary line style",
+        multiselect=False, button_name="Create")
+    if not chosen or chosen == DEFAULT_LINE:
+        return None
+    return styles.get(chosen)
 
 
 def _collect_all():
@@ -694,12 +786,15 @@ def main():
     if frt is None:
         return
 
+    line_style_id = _pick_line_style()
+
     if mode == MODE_ALL:
         result = _collect_all()
         if not result:
             return
         all_loops, counts, skipped = result
-        _build_and_create(frt, all_loops, counts, skipped)
+        _build_and_create(frt, all_loops, counts, skipped,
+                          line_style_id=line_style_id)
         return
 
     # Pick modes: keep picking batches until the user stops.
@@ -711,7 +806,8 @@ def main():
             break
         all_loops, counts, skipped = result
         total += _build_and_create(frt, all_loops, counts, skipped,
-                                   announce=False) or 0
+                                   announce=False,
+                                   line_style_id=line_style_id) or 0
         if not forms.alert(
                 "Created {} filled region(s) so far.\n"
                 "Pick more elements?".format(total),
