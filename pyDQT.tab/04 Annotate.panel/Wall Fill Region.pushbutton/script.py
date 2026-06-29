@@ -258,6 +258,40 @@ def _wall_rect_loops(wall, transform):
     return []
 
 
+def _bbox_rect_loops(elem, transform):
+    """Last-resort footprint: an axis-aligned rectangle from the element's
+    bounding box (used for columns whose solid face is too complex)."""
+    try:
+        bb = elem.get_BoundingBox(None)
+    except Exception:
+        bb = None
+    if bb is None:
+        return []
+    xs, ys = [], []
+    for ix in (bb.Min.X, bb.Max.X):
+        for iy in (bb.Min.Y, bb.Max.Y):
+            for iz in (bb.Min.Z, bb.Max.Z):
+                p = XYZ(ix, iy, iz)
+                if transform is not None:
+                    p = transform.OfPoint(p)
+                xs.append(p.X)
+                ys.append(p.Y)
+    minx, maxx = min(xs), max(xs)
+    miny, maxy = min(ys), max(ys)
+    if (maxx - minx) < MIN_SEG or (maxy - miny) < MIN_SEG:
+        return []
+    a = XYZ(minx, miny, Z0)
+    b = XYZ(maxx, miny, Z0)
+    c = XYZ(maxx, maxy, Z0)
+    d = XYZ(minx, maxy, Z0)
+    loop = CurveLoop()
+    loop.Append(Line.CreateBound(a, b))
+    loop.Append(Line.CreateBound(b, c))
+    loop.Append(Line.CreateBound(c, d))
+    loop.Append(Line.CreateBound(d, a))
+    return [loop]
+
+
 def _footprint_loops(elem, kind, transform):
     loops = _solid_footprint_loops(elem, transform)
     if loops:
@@ -293,16 +327,20 @@ def _good_loops(elem, kind, transform):
         loops = []
     if loops:
         return loops
-    # 2) Fallback for walls whose solid face is too complex (tiny mitred edges
-    # at joins make _loop_ok reject every loop): a clean location-curve
-    # rectangle, which is always valid for a filled region.
+    # 2) Walls: clean location-curve rectangle (handles mitred joins).
     if kind == "wall":
         try:
-            return [lp for lp in _wall_rect_loops(elem, transform)
+            rect = [lp for lp in _wall_rect_loops(elem, transform)
                     if _loop_ok(lp)]
+            if rect:
+                return rect
         except Exception:
-            return []
-    return []
+            pass
+    # 3) Last resort (columns, odd walls): bounding-box rectangle.
+    try:
+        return [lp for lp in _bbox_rect_loops(elem, transform) if _loop_ok(lp)]
+    except Exception:
+        return []
 
 
 def _loop_to_solid(loop):
@@ -463,17 +501,32 @@ def _build_and_create(frt, all_loops, counts, skipped, announce=True):
             skipped += 1
     groups = _merge_groups(items)
 
+    # Collect the merged outline of every group.
+    group_loops = []
+    for solid, orig_loops in groups:
+        bl = [lp for lp in _bottom_loops(solid) if _loop_ok(lp)]
+        group_loops.append((bl, orig_loops))
+
     created = 0
     tg = TransactionGroup(doc, "DQT - Wall Fill Region")
     tg.Start()
-    for solid, orig_loops in groups:
-        merged_loops = _bottom_loops(solid)
-        if merged_loops and _create_region(frt, merged_loops):
-            created += 1
-        else:
-            for lp in orig_loops:
-                if _create_region(frt, [lp]):
-                    created += 1
+
+    # Preferred: ONE filled region holding all (non-overlapping) outlines.
+    combined = []
+    for bl, _orig in group_loops:
+        combined.extend(bl)
+    if combined and _create_region(frt, combined):
+        created = 1
+    else:
+        # Fallback: one region per group, then per original loop, so nothing
+        # is lost if a combined boundary is rejected.
+        for bl, orig_loops in group_loops:
+            if bl and _create_region(frt, bl):
+                created += 1
+            else:
+                for lp in orig_loops:
+                    if _create_region(frt, [lp]):
+                        created += 1
     tg.Assimilate()
 
     if created == 0:
