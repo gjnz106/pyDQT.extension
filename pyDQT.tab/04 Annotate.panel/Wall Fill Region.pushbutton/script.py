@@ -177,12 +177,25 @@ def _solid_footprint_loops(elem, transform):
     opt.DetailLevel = ViewDetailLevel.Fine
     opt.ComputeReferences = False
     geo = elem.get_Geometry(opt)
-    loops = []
+    bottom = []
+    top = []
     for solid in _iter_solids(geo):
         for face in solid.Faces:
-            if isinstance(face, PlanarFace) and face.FaceNormal.Z < -0.9:
-                for cl in face.GetEdgesAsCurveLoops():
-                    loops.append(_transform_flatten_loop(cl, transform))
+            if isinstance(face, PlanarFace):
+                nz = face.FaceNormal.Z
+                if nz < -0.9:
+                    bottom.append(face)
+                elif nz > 0.9:
+                    top.append(face)
+    # Prefer a bottom face; if the solid only exposes a top face, use that.
+    faces = bottom if bottom else top
+    loops = []
+    for face in faces:
+        try:
+            for cl in face.GetEdgesAsCurveLoops():
+                loops.append(_transform_flatten_loop(cl, transform))
+        except Exception:
+            continue
     return loops
 
 
@@ -193,11 +206,17 @@ def _wall_rect_loops(wall, transform):
     curve = loc.Curve
     if transform is not None:
         curve = curve.CreateTransformed(transform)
+    width = None
     try:
         width = wall.Width
     except Exception:
-        return []
-    if width <= TOL:
+        width = None
+    if not width or width <= TOL:
+        try:
+            width = wall.WallType.Width
+        except Exception:
+            width = None
+    if not width or width <= TOL:
         return []
     half = width / 2.0
 
@@ -266,11 +285,24 @@ def _loop_ok(loop):
 
 
 def _good_loops(elem, kind, transform):
+    # 1) Real solid footprint (matches the element incl. joins).
     try:
-        loops = _footprint_loops(elem, kind, transform)
+        loops = [lp for lp in _solid_footprint_loops(elem, transform)
+                 if _loop_ok(lp)]
     except Exception:
         loops = []
-    return [lp for lp in loops if _loop_ok(lp)]
+    if loops:
+        return loops
+    # 2) Fallback for walls whose solid face is too complex (tiny mitred edges
+    # at joins make _loop_ok reject every loop): a clean location-curve
+    # rectangle, which is always valid for a filled region.
+    if kind == "wall":
+        try:
+            return [lp for lp in _wall_rect_loops(elem, transform)
+                    if _loop_ok(lp)]
+        except Exception:
+            return []
+    return []
 
 
 def _loop_to_solid(loop):
@@ -516,18 +548,13 @@ def _collect_all():
             for elem in elems:
                 if not _is_cut(elem, cut_z, transform):
                     continue
-                try:
-                    loops = _footprint_loops(elem, kind, transform)
-                except Exception:
-                    loops = []
-                if not loops or not _loops_in_crop(loops, crop):
+                good = _good_loops(elem, kind, transform)
+                if not good or not _loops_in_crop(good, crop):
+                    if good:
+                        skipped += 1
                     continue
-                good = [lp for lp in loops if _loop_ok(lp)]
-                if good:
-                    all_loops.extend(good)
-                    counts[clabel] = counts.get(clabel, 0) + 1
-                else:
-                    skipped += 1
+                all_loops.extend(good)
+                counts[clabel] = counts.get(clabel, 0) + 1
     return all_loops, counts, skipped
 
 
