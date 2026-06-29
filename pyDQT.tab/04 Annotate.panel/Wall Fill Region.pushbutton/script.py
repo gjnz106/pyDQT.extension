@@ -359,6 +359,20 @@ def _cut_plane_z():
         return None
 
 
+def _view_plane_z():
+    """Elevation of the active plan view's plane, so the filled region loops
+    are coplanar with the view (a region flattened to an arbitrary Z=0 may not
+    show when the view's level is far from 0)."""
+    try:
+        gl = view.GenLevel
+        if gl is not None:
+            return gl.Elevation
+    except Exception:
+        pass
+    z = _cut_plane_z()
+    return z if z is not None else 0.0
+
+
 def _is_cut(elem, cut_z, transform):
     if cut_z is None:
         return True
@@ -611,6 +625,11 @@ def main():
                     "ceiling / area plan).\nOpen a plan view and try again.",
                     title="Wall Fill Region")
         return
+
+    # Place the filled-region loops on the view's own plane so they are visible
+    # (a region flattened to Z=0 may not show when the level is far from 0).
+    global Z0
+    Z0 = _view_plane_z()
 
     mode = forms.SelectFromList.show(
         [MODE_ALL, MODE_HOST, MODE_LINK], title="Wall Fill Region - mode",
