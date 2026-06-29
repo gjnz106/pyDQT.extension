@@ -1,0 +1,2 @@
+title: "Merge Fill\nRegion"
+tooltip: "Merge selected filled regions in the active view into a single filled region (uses the first region's type)."
