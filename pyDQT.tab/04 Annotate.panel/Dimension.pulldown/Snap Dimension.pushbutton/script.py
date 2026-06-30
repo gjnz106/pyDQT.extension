@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Snap to Grid v14 - Round wall/column/beam distances to nearest gridline.
+"""Snap to Grid v15 - Round wall/column/beam distances to nearest gridline.
+
+Apply can also draw a 2D detail line at the rounded distance (parallel to the
+grid) and align the element exactly onto it, giving a visible reference to
+verify the snap. Toggle with the "Draw rounded line" checkbox.
 
 Distances are measured and rounded to the element CENTERLINE (the way the
 dimensions are taken), so snapping a wall/column never leaves the centerline
@@ -42,7 +46,7 @@ from collections import OrderedDict
 import Autodesk.Revit.DB as DB
 from Autodesk.Revit.DB import (
     FilteredElementCollector, BuiltInCategory, Transaction,
-    XYZ, ElementId, Grid, Wall, FamilyInstance,
+    XYZ, ElementId, Grid, Wall, FamilyInstance, Line,
     LocationCurve, LocationPoint, ElementTransformUtils,
 )
 from Autodesk.Revit.UI import TaskDialog
@@ -452,7 +456,10 @@ XAML_STR = """
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <TextBlock x:Name="txtSt" Grid.Column="0" Text="Click Scan." FontSize="11" Foreground="%%DK%%" VerticalAlignment="Center"/>
-                <CheckBox x:Name="chkAll" Grid.Column="1" Content="Select All" VerticalAlignment="Center" Margin="0,0,16,0" IsChecked="True"/>
+                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                    <CheckBox x:Name="chkLine" Content="Draw rounded line" VerticalAlignment="Center" Margin="0,0,16,0" IsChecked="True"/>
+                    <CheckBox x:Name="chkAll" Content="Select All" VerticalAlignment="Center" Margin="0,0,16,0" IsChecked="True"/>
+                </StackPanel>
             </Grid>
         </Border>
 
@@ -513,6 +520,7 @@ class MainWin(object):
         self.cmbMax = self.w.FindName("cmbMax")
         self.dg = self.w.FindName("dg")
         self.txtSt = self.w.FindName("txtSt")
+        self.chkLine = self.w.FindName("chkLine")
         self.w.FindName("btnScan").Click += self._scan
         self.w.FindName("btnHL").Click += self._hl
         self.w.FindName("btnApply").Click += self._apply
@@ -768,6 +776,28 @@ class MainWin(object):
             mv = XYZ(mv.X + n.X * L, mv.Y + n.Y * L, mv.Z)
         return mv
 
+    def _elem_point(self, e):
+        loc = e.Location
+        if isinstance(loc, LocationPoint):
+            return loc.Point
+        if isinstance(loc, LocationCurve):
+            return loc.Curve.Evaluate(0.5, True)
+        return None
+
+    def _draw_ref_line(self, view, p, gdir):
+        """Draw a 2D detail line through p, parallel to a grid (direction gdir),
+        i.e. exactly on the rounded distance the element was aligned to. Guarded
+        so it never breaks the snap (some view types reject detail curves)."""
+        try:
+            half = 6.0   # ft (~1.8 m each side)
+            a = XYZ(p.X - gdir.X * half, p.Y - gdir.Y * half, p.Z)
+            b = XYZ(p.X + gdir.X * half, p.Y + gdir.Y * half, p.Z)
+            if a.DistanceTo(b) < 1e-6:
+                return
+            doc.Create.NewDetailCurve(view, Line.CreateBound(a, b))
+        except:
+            pass
+
     def _apply(self, s, a):
         todo = [i for i in self.items if i.sel]
         if not todo:
@@ -782,22 +812,33 @@ class MainWin(object):
             n = XYZ(i.mv.X / L, i.mv.Y / L, 0)
             cons_by_id.setdefault(i.eid, []).append((n, L))
 
-        moves = OrderedDict()
-        for eid_int, cons in cons_by_id.items():
-            moves[eid_int] = self._solve_move(cons)
+        view = doc.ActiveView
+        draw = bool(self.chkLine.IsChecked)
 
-        ok = fail = 0
+        ok = fail = lines = 0
         t = Transaction(doc, "DQT - Snap to Grid")
         try:
             t.Start()
-            for eid_int, mv in moves.items():
+            for eid_int, cons in cons_by_id.items():
                 try:
                     eid = ElementId(eid_int)
-                    if doc.GetElement(eid):
-                        ElementTransformUtils.MoveElement(doc, eid, mv)
-                        ok += 1
-                    else:
+                    e = doc.GetElement(eid)
+                    if e is None:
                         fail += 1
+                        continue
+                    mv = self._solve_move(cons)
+                    # Draw the rounded grid line(s) the element lands on, then
+                    # move the element exactly onto them.
+                    if draw:
+                        p = self._elem_point(e)
+                        if p is not None:
+                            tgt = XYZ(p.X + mv.X, p.Y + mv.Y, p.Z + mv.Z)
+                            for n, L in cons:
+                                gdir = XYZ(-n.Y, n.X, 0)
+                                self._draw_ref_line(view, tgt, gdir)
+                                lines += 1
+                    ElementTransformUtils.MoveElement(doc, eid, mv)
+                    ok += 1
                 except:
                     fail += 1
             t.Commit()
@@ -809,7 +850,12 @@ class MainWin(object):
 
         self.items = [i for i in self.items if not i.sel]
         self._ref()
-        self.txtSt.Text = "Snapped {}.".format(ok) + (" {} failed.".format(fail) if fail else "")
+        msg = "Snapped {}.".format(ok)
+        if draw and lines:
+            msg += " Drew {} rounded line(s).".format(lines)
+        if fail:
+            msg += " {} failed.".format(fail)
+        self.txtSt.Text = msg
 
     def _tog(self, v):
         for i in self.items:
