@@ -1,14 +1,18 @@
 # -*- coding: utf-8 -*-
-"""Snap to Grid v12 - Round wall/column/beam distances to nearest gridline.
+"""Snap to Grid v13 - Round wall/column/beam distances to nearest gridline.
 
-Added: Scope option - scan all elements or only current selection.
+Distances are measured and rounded to the element CENTERLINE (the way the
+dimensions are taken), so snapping a wall/column never leaves the centerline
+dimension fractional by rounding a face instead.
+
+Scope option - scan all elements or only current selection.
 
 Copyright (c) 2026 by Dang Quoc Truong (DQT)
 """
 
 __title__ = "Snap to\nGrid"
 __author__ = "DQT"
-__doc__ = "Round wall/column/beam offset from grid to whole millimeters"
+__doc__ = "Round wall/column/beam centerline offset from grid to whole mm"
 
 import clr
 import math
@@ -98,42 +102,6 @@ def group_grids_by_direction(grids_info):
     return groups
 
 
-def get_line_elem_half_width(elem):
-    if isinstance(elem, Wall):
-        try:
-            return doc.GetElement(elem.GetTypeId()).Width / 2.0
-        except:
-            return 0.0
-    try:
-        etype = doc.GetElement(elem.GetTypeId())
-        if etype:
-            for bip in [DB.BuiltInParameter.STRUCTURAL_SECTION_COMMON_WIDTH,
-                        DB.BuiltInParameter.FAMILY_WIDTH_PARAM]:
-                try:
-                    p = etype.get_Parameter(bip)
-                    if p and p.HasValue and p.AsDouble() > 0:
-                        return p.AsDouble() / 2.0
-                except:
-                    pass
-            for bip in [DB.BuiltInParameter.STRUCTURAL_SECTION_COMMON_WIDTH]:
-                try:
-                    p = elem.get_Parameter(bip)
-                    if p and p.HasValue and p.AsDouble() > 0:
-                        return p.AsDouble() / 2.0
-                except:
-                    pass
-            for name in ["b", "B", "Width", "W", "bf", "Bf"]:
-                try:
-                    p = etype.LookupParameter(name)
-                    if p and p.HasValue and p.AsDouble() > 0:
-                        return p.AsDouble() / 2.0
-                except:
-                    pass
-    except:
-        pass
-    return 0.0
-
-
 def calc_snap(sc, half_w, grid_dir, precision):
     perp = XYZ(grid_dir.Y, -grid_dir.X, 0)
     s = 1.0 if sc >= 0 else -1.0
@@ -208,7 +176,6 @@ def analyze_wall(elem, grids_info, precision):
     elem_dir = line_dir_2d(curve.GetEndPoint(0), curve.GetEndPoint(1))
     if elem_dir is None:
         return []
-    half_w = get_line_elem_half_width(elem)
 
     best_sd = None
     best_gdir = None
@@ -228,7 +195,9 @@ def analyze_wall(elem, grids_info, precision):
                 best_gname = "?"
     if best_gdir is None:
         return []
-    r = calc_snap(best_sd, half_w, best_gdir, precision)
+    # Snap the wall CENTERLINE distance to the grid (dimensions are taken to
+    # the centerline). half_w = 0 so a face is never rounded instead.
+    r = calc_snap(best_sd, 0.0, best_gdir, precision)
     if not r:
         return []
     shown, snapped, delta, mv = r
@@ -246,10 +215,9 @@ def analyze_beam(elem, grids_info, precision):
     elem_dir = line_dir_2d(p0, p1)
     if elem_dir is None:
         return []
-    half_w = get_line_elem_half_width(elem)
     results = []
 
-    # 1) Nearest parallel grid
+    # 1) Nearest parallel grid - snap the beam CENTERLINE (half_w = 0).
     best_sd = None
     best_gdir = None
     best_gname = ""
@@ -267,7 +235,7 @@ def analyze_beam(elem, grids_info, precision):
             except:
                 best_gname = "?"
     if best_gdir is not None and best_sd is not None:
-        r = calc_snap(best_sd, half_w, best_gdir, precision)
+        r = calc_snap(best_sd, 0.0, best_gdir, precision)
         if r:
             shown, snapped, delta, mv = r
             results.append((best_gname, shown, snapped, delta, mv))
