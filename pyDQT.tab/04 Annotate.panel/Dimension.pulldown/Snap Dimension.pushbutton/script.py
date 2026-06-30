@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-"""Snap to Grid v18 - Round wall/column/beam distances to nearest gridline.
+"""Snap to Grid v19 - Round wall/column/beam distances to nearest gridline.
 
 Apply ALIGNS the element onto the rounded grid line by setting its Location to
 the exact computed position - not a relative move, so no residual accumulates.
-A column is aligned by its CENTRE-LINE reference (the geometric centroid, what a
-dimension snaps to - not the family insertion point, which can differ slightly)
-and placed at the exact intersection of its two rounded grid lines; a wall's
-centerline is projected onto its rounded line. Beams fall back to a measure /
-move / regenerate loop.
+A column is aligned by its CENTRE-LINE reference - the family's Center
+(Left/Right) and Center (Front/Back) reference planes, which is exactly what a
+centre-line dimension snaps to (not the insertion point, nor the solid
+centroid). A wall's centerline is projected onto its rounded line. Beams fall
+back to a measure / move / regenerate loop.
 
 Apply can also draw a 2D detail line at the rounded distance (parallel to the
 grid) and align the element exactly onto it, giving a visible reference to
@@ -57,6 +57,7 @@ from Autodesk.Revit.DB import (
     XYZ, ElementId, Grid, Wall, FamilyInstance, Line,
     LocationCurve, LocationPoint, ElementTransformUtils,
     Options, Solid, GeometryInstance, ViewDetailLevel,
+    FamilyInstanceReferenceType, PlanarFace,
 )
 from Autodesk.Revit.UI import TaskDialog
 
@@ -851,10 +852,11 @@ class MainWin(object):
                     yield s
 
     def _column_center(self, e):
-        """Plan-projected geometric centre of the column's solid - this is where
-        the family's Center (Left/Right) and Center (Front/Back) reference planes
-        cross, i.e. what a dimension to the column centre line snaps to. It can
-        differ slightly from the insertion (Location) point of the family."""
+        """Fallback centre when the family references can't be read: the NOMINAL
+        geometric centre (mid-way between the extreme faces, from the solid's
+        bounding box), not the volume-weighted centroid. The midplane between the
+        faces is what the centre-line reference follows; the volume centroid is
+        pulled off it by any asymmetric geometry."""
         try:
             opt = Options()
             opt.DetailLevel = ViewDetailLevel.Fine
@@ -866,10 +868,78 @@ class MainWin(object):
                     bestv = sol.Volume
                     best = sol
             if best is not None:
-                c = best.ComputeCentroid()
-                return XYZ(c.X, c.Y, 0.0)
+                bb = best.GetBoundingBox()
+                mid = XYZ((bb.Min.X + bb.Max.X) / 2.0,
+                          (bb.Min.Y + bb.Max.Y) / 2.0,
+                          (bb.Min.Z + bb.Max.Z) / 2.0)
+                w = bb.Transform.OfPoint(mid)
+                return XYZ(w.X, w.Y, 0.0)
         except:
             pass
+        return None
+
+    def _ref_point_dir(self, e, ref):
+        """A point on, and the in-plan direction of, a family reference - or
+        (None, None) if its geometry cannot be read."""
+        try:
+            obj = e.GetGeometryObjectFromReference(ref)
+        except:
+            obj = None
+        if obj is None:
+            return None, None
+        if isinstance(obj, PlanarFace):
+            o = obj.Origin
+            n = obj.FaceNormal
+            d = XYZ(-n.Y, n.X, 0)           # in-plan line dir = normal x Z
+            return XYZ(o.X, o.Y, 0), d
+        try:                                # Curve / Line reference
+            a = obj.GetEndPoint(0)
+            b = obj.GetEndPoint(1)
+            return XYZ(a.X, a.Y, 0), XYZ(b.X - a.X, b.Y - a.Y, 0)
+        except:
+            return None, None
+
+    def _column_ref_lines(self, e):
+        """In-plan lines (point, unit dir) of the column's centre-line
+        references: Center (Left/Right) and Center (Front/Back). These are the
+        planes a centre-line dimension actually snaps to."""
+        out = []
+        for rt in (FamilyInstanceReferenceType.CenterLeftRight,
+                   FamilyInstanceReferenceType.CenterFrontBack):
+            try:
+                refs = e.GetReferences(rt)
+            except:
+                refs = None
+            if not refs:
+                continue
+            for r in refs:
+                p, d = self._ref_point_dir(e, r)
+                if p is None or d is None:
+                    continue
+                ln = (d.X * d.X + d.Y * d.Y) ** 0.5
+                if ln < 1e-9:
+                    continue
+                out.append((p, XYZ(d.X / ln, d.Y / ln, 0)))
+                break                        # one line per reference type
+        return out
+
+    def _column_ref_center(self, e):
+        """The point where the two centre-line reference planes cross (it lies
+        on both planes, so it carries the exact centre-line distance to any
+        grid). Falls back to a single reference point, else None."""
+        lines = self._column_ref_lines(e)
+        if len(lines) >= 2:
+            (p1, d1), (p2, d2) = lines[0], lines[1]
+            a, b = d1.X, -d2.X
+            c, dd = d1.Y, -d2.Y
+            det = a * dd - b * c
+            if abs(det) > 1e-9:
+                ex = p2.X - p1.X
+                ey = p2.Y - p1.Y
+                t = (ex * dd - b * ey) / det
+                return XYZ(p1.X + d1.X * t, p1.Y + d1.Y * t, 0)
+        if len(lines) == 1:
+            return lines[0][0]
         return None
 
     def _align_element(self, eid, glist):
@@ -884,13 +954,16 @@ class MainWin(object):
             return None
         loc = e.Location
 
-        # Column (and any point-located element): align the centre-line
-        # REFERENCE (geometric centre), not the insertion point, since that is
-        # what the dimension snaps to. Place the centre on the rounded line(s),
-        # then shift the insertion point by the same vector.
+        # Column (and any point-located element): align the family's CENTRE-LINE
+        # REFERENCE (Center Left/Right + Front/Back), which is what a dimension
+        # snaps to - not the insertion point and not the solid centroid, either
+        # of which can sit slightly off the reference. Place that reference on
+        # the rounded line(s), then shift the insertion point by the same vector.
         if isinstance(loc, LocationPoint):
             p = loc.Point
-            ref = self._column_center(e)
+            ref = self._column_ref_center(e)
+            if ref is None:
+                ref = self._column_center(e)
             if ref is None:
                 ref = p
             try:
@@ -913,7 +986,10 @@ class MainWin(object):
                     loc.Point = XYZ(p.X + (target.X - ref.X),
                                     p.Y + (target.Y - ref.Y), p.Z)
                     doc.Regenerate()
-                    newc = self._column_center(doc.GetElement(eid))
+                    ne = doc.GetElement(eid)
+                    newc = self._column_ref_center(ne)
+                    if newc is None:
+                        newc = self._column_center(ne)
                     if newc is not None:
                         return newc
                 return self._elem_point(doc.GetElement(eid))
