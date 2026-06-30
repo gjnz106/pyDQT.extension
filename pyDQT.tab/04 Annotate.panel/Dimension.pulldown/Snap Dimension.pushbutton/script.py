@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Snap to Grid v15 - Round wall/column/beam distances to nearest gridline.
+"""Snap to Grid v16 - Round wall/column/beam distances to nearest gridline.
+
+Apply uses a closed loop: it measures the element's real distance to the grid,
+moves, regenerates, and repeats until the distance is exactly the rounded value.
+A single open-loop move lands ~0.004 mm off because Revit re-solves joins and
+regenerates after moving; re-measuring each pass drives the residual to zero.
 
 Apply can also draw a 2D detail line at the rounded distance (parallel to the
 grid) and align the element exactly onto it, giving a visible reference to
@@ -56,6 +61,8 @@ uidoc = __revit__.ActiveUIDocument
 
 FEET_TO_MM = 304.8
 SNAP_TOL = 0.0001
+CONV_TOL = 1.0e-7   # ft (~3e-5 mm) - convergence target when aligning
+MAX_ITER = 8        # re-measure / move passes per element
 
 
 def get_id_value(eid):
@@ -188,6 +195,7 @@ def analyze_wall(elem, grids_info, precision):
 
     best_sd = None
     best_gdir = None
+    best_go = None
     best_gname = ""
     best_abs = float("inf")
     for g, go, gd in grids_info:
@@ -198,6 +206,7 @@ def analyze_wall(elem, grids_info, precision):
             best_abs = abs(sd)
             best_sd = sd
             best_gdir = gd
+            best_go = go
             try:
                 best_gname = DB.Element.Name.GetValue(g)
             except:
@@ -210,7 +219,7 @@ def analyze_wall(elem, grids_info, precision):
     if not r:
         return []
     shown, snapped, delta, mv = r
-    return [(best_gname, shown, snapped, delta, mv)]
+    return [(best_gname, shown, snapped, delta, mv, best_go, best_gdir)]
 
 
 def analyze_beam(elem, grids_info, precision):
@@ -229,6 +238,7 @@ def analyze_beam(elem, grids_info, precision):
     # 1) Nearest parallel grid - snap the beam CENTERLINE (half_w = 0).
     best_sd = None
     best_gdir = None
+    best_go = None
     best_gname = ""
     best_abs = float("inf")
     for g, go, gd in grids_info:
@@ -239,6 +249,7 @@ def analyze_beam(elem, grids_info, precision):
             best_abs = abs(sd)
             best_sd = sd
             best_gdir = gd
+            best_go = go
             try:
                 best_gname = DB.Element.Name.GetValue(g)
             except:
@@ -247,7 +258,8 @@ def analyze_beam(elem, grids_info, precision):
         r = calc_snap(best_sd, 0.0, best_gdir, precision)
         if r:
             shown, snapped, delta, mv = r
-            results.append((best_gname, shown, snapped, delta, mv))
+            results.append((best_gname, shown, snapped, delta, mv,
+                            best_go, best_gdir))
 
     # 2) Perpendicular grids - nearest endpoint
     perp_grids = [(g, go, gd) for g, go, gd in grids_info
@@ -277,7 +289,8 @@ def analyze_beam(elem, grids_info, precision):
                                        best_ep_gdir, precision)
                 if r:
                     shown, snapped, delta, mv = r
-                    results.append((best_ep_gname, shown, snapped, delta, mv))
+                    results.append((best_ep_gname, shown, snapped, delta, mv,
+                                    best_ep_go, best_ep_gdir))
     return results
 
 
@@ -302,27 +315,27 @@ def analyze_column(elem, grids_info, precision):
             gname = DB.Element.Name.GetValue(g)
         except:
             gname = "?"
-        dists.append((abs(sd), sd, gd, gname))
+        dists.append((abs(sd), sd, go, gd, gname))
     if not dists:
         return []
     dists.sort(key=lambda d: d[0])
 
-    chosen = []          # (sd, gd, gname) - nearest grid per distinct direction
+    chosen = []          # (sd, go, gd, gname) - nearest grid per direction
     chosen_dirs = []
-    for _, sd, gd, gname in dists:
+    for _, sd, go, gd, gname in dists:
         if any(is_parallel(gd, cg) for cg in chosen_dirs):
             continue
-        chosen.append((sd, gd, gname))
+        chosen.append((sd, go, gd, gname))
         chosen_dirs.append(gd)
         if len(chosen) >= 2:
             break
 
     results = []
-    for sd, gd, gname in chosen:
+    for sd, go, gd, gname in chosen:
         r = calc_snap(sd, 0.0, gd, precision)
         if r:
             shown, snapped, delta, mv = r
-            results.append((gname, shown, snapped, delta, mv))
+            results.append((gname, shown, snapped, delta, mv, go, gd))
     return results
 
 
@@ -485,7 +498,8 @@ XAML_STR = """
 
 
 class SI(object):
-    def __init__(self, eid, cat, ft, gn, dist, snap, delta, lv, mv):
+    def __init__(self, eid, cat, ft, gn, dist, snap, delta, lv, mv,
+                 go=None, gd=None):
         self.sel = True
         self.eid = eid
         self.cat = cat
@@ -496,6 +510,8 @@ class SI(object):
         self.delta = delta
         self.lv = lv
         self.mv = mv
+        self.go = go    # a point on the grid this row snaps to
+        self.gd = gd    # the grid's unit direction
 
 
 class MainWin(object):
@@ -674,7 +690,8 @@ class MainWin(object):
         ni = 0
 
         for e in walls:
-            for gn, dist, snap, delta, mv in analyze_wall(e, grids_info, pr):
+            for gn, dist, snap, delta, mv, go, gd in analyze_wall(
+                    e, grids_info, pr):
                 if abs(delta) > mx:
                     continue
                 ni += 1
@@ -684,10 +701,12 @@ class MainWin(object):
                 except:
                     pass
                 self.items.append(SI(get_id_value(e.Id), cn, self._ft(e),
-                                     gn, dist, snap, delta, self._lv(e), mv))
+                                     gn, dist, snap, delta, self._lv(e), mv,
+                                     go, gd))
 
         for e in beams:
-            for gn, dist, snap, delta, mv in analyze_beam(e, grids_info, pr):
+            for gn, dist, snap, delta, mv, go, gd in analyze_beam(
+                    e, grids_info, pr):
                 if abs(delta) > mx:
                     continue
                 ni += 1
@@ -697,10 +716,12 @@ class MainWin(object):
                 except:
                     pass
                 self.items.append(SI(get_id_value(e.Id), cn, self._ft(e),
-                                     gn, dist, snap, delta, self._lv(e), mv))
+                                     gn, dist, snap, delta, self._lv(e), mv,
+                                     go, gd))
 
         for e in columns:
-            for gn, dist, snap, delta, mv in analyze_column(e, grids_info, pr):
+            for gn, dist, snap, delta, mv, go, gd in analyze_column(
+                    e, grids_info, pr):
                 if abs(delta) > mx:
                     continue
                 ni += 1
@@ -710,7 +731,8 @@ class MainWin(object):
                 except:
                     pass
                 self.items.append(SI(get_id_value(e.Id), cn, self._ft(e),
-                                     gn, dist, snap, delta, self._lv(e), mv))
+                                     gn, dist, snap, delta, self._lv(e), mv,
+                                     go, gd))
 
         self._ref()
         scope_name = "selected" if self.cmbScope.SelectedIndex == 1 else "total"
@@ -798,19 +820,48 @@ class MainWin(object):
         except:
             pass
 
+    def _align_element(self, eid, glist):
+        """Move an element onto its rounded grid distance(s) using a closed
+        loop: measure the real distance, move, regenerate, and repeat. A single
+        open-loop move lands ~0.004 mm off because Revit re-solves joins and
+        regenerates after the move; re-measuring the actual geometry each pass
+        drives the residual to zero. Returns the element's final point."""
+        e = doc.GetElement(eid)
+        if e is None:
+            return None
+        for _ in range(MAX_ITER):
+            p = self._elem_point(e)
+            if p is None:
+                return None
+            cons = []
+            maxd = 0.0
+            for go, gd, tmm in glist:
+                sd = signed_perp(go, gd, p)
+                s = 1.0 if sd >= 0 else -1.0
+                tgt = s * (tmm / FEET_TO_MM)
+                d = tgt - sd                       # required move along perp
+                perp = XYZ(gd.Y, -gd.X, 0)
+                cons.append((perp, d))
+                if abs(d) > maxd:
+                    maxd = abs(d)
+            if maxd <= CONV_TOL:
+                break
+            ElementTransformUtils.MoveElement(doc, eid, self._solve_move(cons))
+            doc.Regenerate()
+        return self._elem_point(doc.GetElement(eid))
+
     def _apply(self, s, a):
         todo = [i for i in self.items if i.sel]
         if not todo:
             self.txtSt.Text = "Nothing selected."
             return
 
-        cons_by_id = OrderedDict()
+        # Group the grid constraints (origin, direction, rounded mm) per element.
+        glist_by_id = OrderedDict()
         for i in todo:
-            L = i.mv.GetLength()
-            if L < 1e-12:
+            if i.go is None or i.gd is None:
                 continue
-            n = XYZ(i.mv.X / L, i.mv.Y / L, 0)
-            cons_by_id.setdefault(i.eid, []).append((n, L))
+            glist_by_id.setdefault(i.eid, []).append((i.go, i.gd, i.snap))
 
         view = doc.ActiveView
         draw = bool(self.chkLine.IsChecked)
@@ -819,26 +870,19 @@ class MainWin(object):
         t = Transaction(doc, "DQT - Snap to Grid")
         try:
             t.Start()
-            for eid_int, cons in cons_by_id.items():
+            for eid_int, glist in glist_by_id.items():
                 try:
                     eid = ElementId(eid_int)
-                    e = doc.GetElement(eid)
-                    if e is None:
+                    pf = self._align_element(eid, glist)
+                    if pf is None:
                         fail += 1
                         continue
-                    mv = self._solve_move(cons)
-                    # Draw the rounded grid line(s) the element lands on, then
-                    # move the element exactly onto them.
-                    if draw:
-                        p = self._elem_point(e)
-                        if p is not None:
-                            tgt = XYZ(p.X + mv.X, p.Y + mv.Y, p.Z + mv.Z)
-                            for n, L in cons:
-                                gdir = XYZ(-n.Y, n.X, 0)
-                                self._draw_ref_line(view, tgt, gdir)
-                                lines += 1
-                    ElementTransformUtils.MoveElement(doc, eid, mv)
                     ok += 1
+                    # Draw the rounded grid line(s) through the final position.
+                    if draw:
+                        for go, gd, tmm in glist:
+                            self._draw_ref_line(view, pf, gd)
+                            lines += 1
                 except:
                     fail += 1
             t.Commit()
