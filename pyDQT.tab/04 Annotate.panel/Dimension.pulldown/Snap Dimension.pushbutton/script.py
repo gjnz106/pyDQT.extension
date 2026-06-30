@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Snap to Grid v20 - Round wall/column/beam distances to nearest gridline.
+"""Snap to Grid v21 - Round wall/column/beam distances to nearest gridline.
 
 The snap/align works in any view. The optional rounded reference line is 2D
 detail annotation, so it is only drawn in 2D views (plan/section/elevation/
@@ -1011,7 +1011,7 @@ class MainWin(object):
                 a = cur.GetEndPoint(0)
                 b = cur.GetEndPoint(1)
                 mid = cur.Evaluate(0.5, True)
-                for go, gd, tmm in glist:
+                for go, gd, tmm, mv in glist:
                     perp, c = self._line_const(go, gd, mid, tmm)
                     a = self._project_onto(a, perp, c)
                     b = self._project_onto(b, perp, c)
@@ -1022,25 +1022,18 @@ class MainWin(object):
             except:
                 pass   # fall back to the move loop below
 
-        # Fallback (beams, odd cases): closed-loop measure / move / regenerate.
-        for _ in range(MAX_ITER):
-            p = self._elem_point(e)
-            if p is None:
-                return None
-            cons = []
-            maxd = 0.0
-            for go, gd, tmm in glist:
-                sd = signed_perp(go, gd, p)
-                s = 1.0 if sd >= 0 else -1.0
-                tgt = s * (tmm / FEET_TO_MM)
-                d = tgt - sd
-                perp = XYZ(gd.Y, -gd.X, 0)
-                cons.append((perp, d))
-                if abs(d) > maxd:
-                    maxd = abs(d)
-            if maxd <= CONV_TOL:
-                break
-            ElementTransformUtils.MoveElement(doc, eid, self._solve_move(cons))
+        # Fallback (beams, odd cases): apply the SUM of the precomputed
+        # per-constraint moves. Each mv was measured at scan time from the right
+        # reference point (the beam midpoint for its parallel grid, the relevant
+        # END for a perpendicular grid), so it must be used as-is. Recomputing a
+        # perpendicular-grid distance from the midpoint here would be wrong by
+        # roughly half the beam length and fling the beam away.
+        total = XYZ(0, 0, 0)
+        for go, gd, tmm, mv in glist:
+            if mv is not None:
+                total = XYZ(total.X + mv.X, total.Y + mv.Y, total.Z + mv.Z)
+        if total.GetLength() > 1e-12:
+            ElementTransformUtils.MoveElement(doc, eid, total)
             doc.Regenerate()
         return self._elem_point(doc.GetElement(eid))
 
@@ -1050,12 +1043,16 @@ class MainWin(object):
             self.txtSt.Text = "Nothing selected."
             return
 
-        # Group the grid constraints (origin, direction, rounded mm) per element.
+        # Group the grid constraints per element: grid origin, direction,
+        # rounded mm, and the precomputed per-constraint move (mv is measured
+        # from the correct point - midpoint for a parallel grid, the END for a
+        # beam's perpendicular grid - so it must not be recomputed from the
+        # midpoint).
         glist_by_id = OrderedDict()
         for i in todo:
             if i.go is None or i.gd is None:
                 continue
-            glist_by_id.setdefault(i.eid, []).append((i.go, i.gd, i.snap))
+            glist_by_id.setdefault(i.eid, []).append((i.go, i.gd, i.snap, i.mv))
 
         view = doc.ActiveView
         # Detail lines are 2D annotation - they can't be created in a 3D view.
@@ -1076,7 +1073,7 @@ class MainWin(object):
                     ok += 1
                     # Draw the rounded grid line(s) through the final position.
                     if draw:
-                        for go, gd, tmm in glist:
+                        for go, gd, tmm, mv in glist:
                             if self._draw_ref_line(view, pf, gd):
                                 lines += 1
                 except:
