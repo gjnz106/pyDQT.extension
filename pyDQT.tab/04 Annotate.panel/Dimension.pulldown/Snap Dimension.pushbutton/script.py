@@ -1,9 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Snap to Grid v13 - Round wall/column/beam distances to nearest gridline.
+"""Snap to Grid v14 - Round wall/column/beam distances to nearest gridline.
 
 Distances are measured and rounded to the element CENTERLINE (the way the
 dimensions are taken), so snapping a wall/column never leaves the centerline
 dimension fractional by rounding a face instead.
+
+When an element is snapped to two grids at once (e.g. a column at a grid
+intersection) the combined move is solved as a 2x2 system, so both dimensions
+land on a whole number even when the grids are not exactly perpendicular -
+instead of the two independent moves being summed and leaving a small residual.
 
 Scope option - scan all elements or only current selection.
 
@@ -736,21 +741,50 @@ class MainWin(object):
             uidoc.Selection.SetElementIds(ids)
             self.txtSt.Text = "Highlighted {}.".format(ids.Count)
 
+    def _solve_move(self, cons):
+        """Find the single translation that satisfies every snap constraint
+        for one element. Each constraint is (n, L): move . n = L, with n a unit
+        direction. Two independent per-grid moves cannot just be added when the
+        grids are not exactly perpendicular - that leaves a residual on each
+        dimension (e.g. 2425.042 instead of 2425). With exactly two
+        non-parallel constraints we solve the 2x2 system so both dimensions
+        land on a whole number; otherwise we fall back to summation."""
+        if len(cons) == 1:
+            n, L = cons[0]
+            return XYZ(n.X * L, n.Y * L, 0)
+        if len(cons) >= 2:
+            (n1, L1), (n2, L2) = cons[0], cons[1]
+            a, b, c, d = n1.X, n1.Y, n2.X, n2.Y
+            det = a * d - b * c
+            if abs(det) > 1e-9:
+                mx = (L1 * d - b * L2) / det
+                my = (a * L2 - L1 * c) / det
+                mv = XYZ(mx, my, 0)
+                for n, L in cons[2:]:   # rare: 3+ constraints (some beams)
+                    mv = XYZ(mv.X + n.X * L, mv.Y + n.Y * L, mv.Z)
+                return mv
+        mv = XYZ(0, 0, 0)
+        for n, L in cons:
+            mv = XYZ(mv.X + n.X * L, mv.Y + n.Y * L, mv.Z)
+        return mv
+
     def _apply(self, s, a):
         todo = [i for i in self.items if i.sel]
         if not todo:
             self.txtSt.Text = "Nothing selected."
             return
 
-        moves = OrderedDict()
+        cons_by_id = OrderedDict()
         for i in todo:
-            if i.eid not in moves:
-                moves[i.eid] = XYZ(0, 0, 0)
-            moves[i.eid] = XYZ(
-                moves[i.eid].X + i.mv.X,
-                moves[i.eid].Y + i.mv.Y,
-                moves[i.eid].Z + i.mv.Z,
-            )
+            L = i.mv.GetLength()
+            if L < 1e-12:
+                continue
+            n = XYZ(i.mv.X / L, i.mv.Y / L, 0)
+            cons_by_id.setdefault(i.eid, []).append((n, L))
+
+        moves = OrderedDict()
+        for eid_int, cons in cons_by_id.items():
+            moves[eid_int] = self._solve_move(cons)
 
         ok = fail = 0
         t = Transaction(doc, "DQT - Snap to Grid")
