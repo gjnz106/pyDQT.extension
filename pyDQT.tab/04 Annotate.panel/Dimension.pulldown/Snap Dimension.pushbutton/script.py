@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
-"""Snap to Grid v17 - Round wall/column/beam distances to nearest gridline.
+"""Snap to Grid v18 - Round wall/column/beam distances to nearest gridline.
 
 Apply ALIGNS the element onto the rounded grid line by setting its Location to
 the exact computed position - not a relative move, so no residual accumulates.
-A column is placed at the exact intersection of its two rounded grid lines; a
-wall's centerline is projected onto its rounded line. Beams fall back to a
-measure / move / regenerate loop.
+A column is aligned by its CENTRE-LINE reference (the geometric centroid, what a
+dimension snaps to - not the family insertion point, which can differ slightly)
+and placed at the exact intersection of its two rounded grid lines; a wall's
+centerline is projected onto its rounded line. Beams fall back to a measure /
+move / regenerate loop.
 
 Apply can also draw a 2D detail line at the rounded distance (parallel to the
 grid) and align the element exactly onto it, giving a visible reference to
@@ -54,6 +56,7 @@ from Autodesk.Revit.DB import (
     FilteredElementCollector, BuiltInCategory, Transaction,
     XYZ, ElementId, Grid, Wall, FamilyInstance, Line,
     LocationCurve, LocationPoint, ElementTransformUtils,
+    Options, Solid, GeometryInstance, ViewDetailLevel,
 )
 from Autodesk.Revit.UI import TaskDialog
 
@@ -836,6 +839,39 @@ class MainWin(object):
         k = c - (perp.X * pt.X + perp.Y * pt.Y)
         return XYZ(pt.X + perp.X * k, pt.Y + perp.Y * k, pt.Z)
 
+    def _iter_solids(self, geo):
+        if geo is None:
+            return
+        for g in geo:
+            if isinstance(g, Solid):
+                if g.Volume > 1e-9:
+                    yield g
+            elif isinstance(g, GeometryInstance):
+                for s in self._iter_solids(g.GetInstanceGeometry()):
+                    yield s
+
+    def _column_center(self, e):
+        """Plan-projected geometric centre of the column's solid - this is where
+        the family's Center (Left/Right) and Center (Front/Back) reference planes
+        cross, i.e. what a dimension to the column centre line snaps to. It can
+        differ slightly from the insertion (Location) point of the family."""
+        try:
+            opt = Options()
+            opt.DetailLevel = ViewDetailLevel.Fine
+            opt.ComputeReferences = False
+            best = None
+            bestv = 0.0
+            for sol in self._iter_solids(e.get_Geometry(opt)):
+                if sol.Volume > bestv:
+                    bestv = sol.Volume
+                    best = sol
+            if best is not None:
+                c = best.ComputeCentroid()
+                return XYZ(c.X, c.Y, 0.0)
+        except:
+            pass
+        return None
+
     def _align_element(self, eid, glist):
         """Align an element ONTO its rounded grid line(s) by setting its
         Location to the exact computed position - not a relative move, so no
@@ -848,25 +884,38 @@ class MainWin(object):
             return None
         loc = e.Location
 
-        # Column (and any point-located element): set the point absolutely.
+        # Column (and any point-located element): align the centre-line
+        # REFERENCE (geometric centre), not the insertion point, since that is
+        # what the dimension snaps to. Place the centre on the rounded line(s),
+        # then shift the insertion point by the same vector.
         if isinstance(loc, LocationPoint):
             p = loc.Point
+            ref = self._column_center(e)
+            if ref is None:
+                ref = p
             try:
+                target = None
                 if len(glist) >= 2:
-                    p1, c1 = self._line_const(glist[0][0], glist[0][1], p,
+                    p1, c1 = self._line_const(glist[0][0], glist[0][1], ref,
                                               glist[0][2])
-                    p2, c2 = self._line_const(glist[1][0], glist[1][1], p,
+                    p2, c2 = self._line_const(glist[1][0], glist[1][1], ref,
                                               glist[1][2])
                     det = p1.X * p2.Y - p1.Y * p2.X
                     if abs(det) > 1e-9:
                         x = (c1 * p2.Y - p1.Y * c2) / det
                         y = (p1.X * c2 - c1 * p2.X) / det
-                        loc.Point = XYZ(x, y, p.Z)
+                        target = XYZ(x, y, 0)
                 else:
-                    perp, c = self._line_const(glist[0][0], glist[0][1], p,
+                    perp, c = self._line_const(glist[0][0], glist[0][1], ref,
                                                glist[0][2])
-                    loc.Point = self._project_onto(p, perp, c)
-                doc.Regenerate()
+                    target = self._project_onto(ref, perp, c)
+                if target is not None:
+                    loc.Point = XYZ(p.X + (target.X - ref.X),
+                                    p.Y + (target.Y - ref.Y), p.Z)
+                    doc.Regenerate()
+                    newc = self._column_center(doc.GetElement(eid))
+                    if newc is not None:
+                        return newc
                 return self._elem_point(doc.GetElement(eid))
             except:
                 pass   # fall back to the move loop below
