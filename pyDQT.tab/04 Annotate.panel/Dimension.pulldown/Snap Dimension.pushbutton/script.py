@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Snap to Grid v19 - Round wall/column/beam distances to nearest gridline.
+"""Snap to Grid v20 - Round wall/column/beam distances to nearest gridline.
+
+The snap/align works in any view. The optional rounded reference line is 2D
+detail annotation, so it is only drawn in 2D views (plan/section/elevation/
+drafting); in a 3D view the elements are still snapped but no line is drawn and
+the status says so.
 
 Apply ALIGNS the element onto the rounded grid line by setting its Location to
 the exact computed position - not a relative move, so no residual accumulates.
@@ -813,17 +818,20 @@ class MainWin(object):
 
     def _draw_ref_line(self, view, p, gdir):
         """Draw a 2D detail line through p, parallel to a grid (direction gdir),
-        i.e. exactly on the rounded distance the element was aligned to. Guarded
-        so it never breaks the snap (some view types reject detail curves)."""
+        i.e. exactly on the rounded distance the element was aligned to. Returns
+        True if drawn. Detail curves are view-specific 2D annotation and cannot
+        live in a 3D view, so this is guarded and simply reports failure there
+        (the snap itself already happened)."""
         try:
             half = 6.0   # ft (~1.8 m each side)
             a = XYZ(p.X - gdir.X * half, p.Y - gdir.Y * half, p.Z)
             b = XYZ(p.X + gdir.X * half, p.Y + gdir.Y * half, p.Z)
             if a.DistanceTo(b) < 1e-6:
-                return
+                return False
             doc.Create.NewDetailCurve(view, Line.CreateBound(a, b))
+            return True
         except:
-            pass
+            return False
 
     def _line_const(self, go, gd, p, tmm):
         """The rounded grid line as perp . X = c (perp unit), placed on the
@@ -1050,7 +1058,9 @@ class MainWin(object):
             glist_by_id.setdefault(i.eid, []).append((i.go, i.gd, i.snap))
 
         view = doc.ActiveView
-        draw = bool(self.chkLine.IsChecked)
+        # Detail lines are 2D annotation - they can't be created in a 3D view.
+        can_draw = (view.ViewType != DB.ViewType.ThreeD)
+        draw = bool(self.chkLine.IsChecked) and can_draw
 
         ok = fail = lines = 0
         t = Transaction(doc, "DQT - Snap to Grid")
@@ -1067,8 +1077,8 @@ class MainWin(object):
                     # Draw the rounded grid line(s) through the final position.
                     if draw:
                         for go, gd, tmm in glist:
-                            self._draw_ref_line(view, pf, gd)
-                            lines += 1
+                            if self._draw_ref_line(view, pf, gd):
+                                lines += 1
                 except:
                     fail += 1
             t.Commit()
@@ -1081,8 +1091,10 @@ class MainWin(object):
         self.items = [i for i in self.items if not i.sel]
         self._ref()
         msg = "Snapped {}.".format(ok)
-        if draw and lines:
+        if lines:
             msg += " Drew {} rounded line(s).".format(lines)
+        if ok and bool(self.chkLine.IsChecked) and not can_draw:
+            msg += " (No 2D line in a 3D view - run in a plan/section.)"
         if fail:
             msg += " {} failed.".format(fail)
         self.txtSt.Text = msg
