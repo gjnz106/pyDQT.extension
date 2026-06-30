@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Snap to Grid v16 - Round wall/column/beam distances to nearest gridline.
+"""Snap to Grid v17 - Round wall/column/beam distances to nearest gridline.
 
-Apply uses a closed loop: it measures the element's real distance to the grid,
-moves, regenerates, and repeats until the distance is exactly the rounded value.
-A single open-loop move lands ~0.004 mm off because Revit re-solves joins and
-regenerates after moving; re-measuring each pass drives the residual to zero.
+Apply ALIGNS the element onto the rounded grid line by setting its Location to
+the exact computed position - not a relative move, so no residual accumulates.
+A column is placed at the exact intersection of its two rounded grid lines; a
+wall's centerline is projected onto its rounded line. Beams fall back to a
+measure / move / regenerate loop.
 
 Apply can also draw a 2D detail line at the rounded distance (parallel to the
 grid) and align the element exactly onto it, giving a visible reference to
@@ -820,15 +821,75 @@ class MainWin(object):
         except:
             pass
 
+    def _line_const(self, go, gd, p, tmm):
+        """The rounded grid line as perp . X = c (perp unit), placed on the
+        element's current side of the grid. Returns (perp, c)."""
+        sd = signed_perp(go, gd, p)
+        s = 1.0 if sd >= 0 else -1.0
+        tgt = s * (tmm / FEET_TO_MM)
+        perp = XYZ(gd.Y, -gd.X, 0)
+        c = tgt + (perp.X * go.X + perp.Y * go.Y)
+        return perp, c
+
+    def _project_onto(self, pt, perp, c):
+        """Perpendicular foot of pt on the line perp . X = c (perp unit)."""
+        k = c - (perp.X * pt.X + perp.Y * pt.Y)
+        return XYZ(pt.X + perp.X * k, pt.Y + perp.Y * k, pt.Z)
+
     def _align_element(self, eid, glist):
-        """Move an element onto its rounded grid distance(s) using a closed
-        loop: measure the real distance, move, regenerate, and repeat. A single
-        open-loop move lands ~0.004 mm off because Revit re-solves joins and
-        regenerates after the move; re-measuring the actual geometry each pass
-        drives the residual to zero. Returns the element's final point."""
+        """Align an element ONTO its rounded grid line(s) by setting its
+        Location to the exact computed position - not a relative move, so no
+        residual accumulates. A column is placed at the exact intersection of
+        its two rounded lines; a wall's centerline is projected onto its rounded
+        line. Beams / other curve-driven elements fall back to a measure-move-
+        regenerate loop. Returns the element's final point."""
         e = doc.GetElement(eid)
         if e is None:
             return None
+        loc = e.Location
+
+        # Column (and any point-located element): set the point absolutely.
+        if isinstance(loc, LocationPoint):
+            p = loc.Point
+            try:
+                if len(glist) >= 2:
+                    p1, c1 = self._line_const(glist[0][0], glist[0][1], p,
+                                              glist[0][2])
+                    p2, c2 = self._line_const(glist[1][0], glist[1][1], p,
+                                              glist[1][2])
+                    det = p1.X * p2.Y - p1.Y * p2.X
+                    if abs(det) > 1e-9:
+                        x = (c1 * p2.Y - p1.Y * c2) / det
+                        y = (p1.X * c2 - c1 * p2.X) / det
+                        loc.Point = XYZ(x, y, p.Z)
+                else:
+                    perp, c = self._line_const(glist[0][0], glist[0][1], p,
+                                               glist[0][2])
+                    loc.Point = self._project_onto(p, perp, c)
+                doc.Regenerate()
+                return self._elem_point(doc.GetElement(eid))
+            except:
+                pass   # fall back to the move loop below
+
+        # Wall: project its centerline endpoints onto the rounded line.
+        elif isinstance(e, Wall) and isinstance(loc, LocationCurve):
+            try:
+                cur = loc.Curve
+                a = cur.GetEndPoint(0)
+                b = cur.GetEndPoint(1)
+                mid = cur.Evaluate(0.5, True)
+                for go, gd, tmm in glist:
+                    perp, c = self._line_const(go, gd, mid, tmm)
+                    a = self._project_onto(a, perp, c)
+                    b = self._project_onto(b, perp, c)
+                    mid = self._project_onto(mid, perp, c)
+                loc.Curve = Line.CreateBound(a, b)
+                doc.Regenerate()
+                return self._elem_point(doc.GetElement(eid))
+            except:
+                pass   # fall back to the move loop below
+
+        # Fallback (beams, odd cases): closed-loop measure / move / regenerate.
         for _ in range(MAX_ITER):
             p = self._elem_point(e)
             if p is None:
@@ -839,7 +900,7 @@ class MainWin(object):
                 sd = signed_perp(go, gd, p)
                 s = 1.0 if sd >= 0 else -1.0
                 tgt = s * (tmm / FEET_TO_MM)
-                d = tgt - sd                       # required move along perp
+                d = tgt - sd
                 perp = XYZ(gd.Y, -gd.X, 0)
                 cons.append((perp, d))
                 if abs(d) > maxd:
