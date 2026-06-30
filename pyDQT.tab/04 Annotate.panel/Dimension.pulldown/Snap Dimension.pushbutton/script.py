@@ -272,7 +272,7 @@ def analyze_beam(elem, grids_info, precision):
     return results
 
 
-def analyze_column(elem, grid_groups, precision):
+def analyze_column(elem, grids_info, precision):
     loc = elem.Location
     if isinstance(loc, LocationPoint):
         pt = loc.Point
@@ -280,28 +280,40 @@ def analyze_column(elem, grid_groups, precision):
         pt = loc.Curve.Evaluate(0.5, True)
     else:
         return []
-    results = []
-    for group in grid_groups:
-        best_sd = None
-        best_gdir = None
-        best_gname = ""
-        best_abs = float("inf")
-        for g, go, gd in group:
-            sd = signed_perp(go, gd, pt)
-            if abs(sd) < best_abs:
-                best_abs = abs(sd)
-                best_sd = sd
-                best_gdir = gd
-                try:
-                    best_gname = DB.Element.Name.GetValue(g)
-                except:
-                    best_gname = "?"
-        if best_gdir is None:
+
+    # A column sits at a grid intersection, so it only makes sense to snap it
+    # to the NEAREST grid in each of the (up to two) principal directions - not
+    # to every grid in the project. Otherwise one column produces dozens of
+    # rows (incl. grids tens of metres away) and the per-element move-summing in
+    # Apply would push the column off its position.
+    dists = []
+    for g, go, gd in grids_info:
+        sd = signed_perp(go, gd, pt)
+        try:
+            gname = DB.Element.Name.GetValue(g)
+        except:
+            gname = "?"
+        dists.append((abs(sd), sd, gd, gname))
+    if not dists:
+        return []
+    dists.sort(key=lambda d: d[0])
+
+    chosen = []          # (sd, gd, gname) - nearest grid per distinct direction
+    chosen_dirs = []
+    for _, sd, gd, gname in dists:
+        if any(is_parallel(gd, cg) for cg in chosen_dirs):
             continue
-        r = calc_snap(best_sd, 0.0, best_gdir, precision)
+        chosen.append((sd, gd, gname))
+        chosen_dirs.append(gd)
+        if len(chosen) >= 2:
+            break
+
+    results = []
+    for sd, gd, gname in chosen:
+        r = calc_snap(sd, 0.0, gd, precision)
         if r:
             shown, snapped, delta, mv = r
-            results.append((best_gname, shown, snapped, delta, mv))
+            results.append((gname, shown, snapped, delta, mv))
     return results
 
 
@@ -638,8 +650,6 @@ class MainWin(object):
             self.txtSt.Text = "No grids found."
             return
 
-        grid_groups = group_grids_by_direction(grids_info)
-
         walls, beams, columns = self._get_elements(cats)
         ns = len(walls) + len(beams) + len(columns)
 
@@ -677,7 +687,7 @@ class MainWin(object):
                                      gn, dist, snap, delta, self._lv(e), mv))
 
         for e in columns:
-            for gn, dist, snap, delta, mv in analyze_column(e, grid_groups, pr):
+            for gn, dist, snap, delta, mv in analyze_column(e, grids_info, pr):
                 if abs(delta) > mx:
                     continue
                 ni += 1
@@ -691,7 +701,8 @@ class MainWin(object):
 
         self._ref()
         scope_name = "selected" if self.cmbScope.SelectedIndex == 1 else "total"
-        self.txtSt.Text = "Scanned {} ({}). Found {} fractional.".format(
+        self.txtSt.Text = ("Scanned {} element(s) ({}). "
+                           "Found {} grid distance(s) to round.").format(
             ns, scope_name, ni)
 
     def _ref(self):
