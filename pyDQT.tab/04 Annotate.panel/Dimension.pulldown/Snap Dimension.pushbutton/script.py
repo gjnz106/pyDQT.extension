@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Snap to Grid v22 - Round wall/column/beam distances to nearest gridline.
+"""Snap to Grid v23 - Round wall/column/beam distances to nearest gridline.
 
 The snap/align works in any view. The optional rounded reference line is 2D
 detail annotation, so it is only drawn in 2D views (plan/section/elevation/
@@ -951,22 +951,24 @@ class MainWin(object):
         return None
 
     def _align_element(self, eid, glist):
-        """Align an element ONTO its rounded grid line(s) by setting its
-        Location to the exact computed position - not a relative move, so no
-        residual accumulates. A column is placed at the exact intersection of
-        its two rounded lines; a wall's centerline is projected onto its rounded
-        line. Beams / other curve-driven elements fall back to a measure-move-
-        regenerate loop. Returns the element's final point."""
+        """Align an element onto its rounded grid line(s) and return the draw
+        anchors as a list of (point, grid_dir): where the rounded reference line
+        for each grid should pass through the element. Points are flattened to
+        Z=0 so the 2D detail line is created the same way for every element type
+        (a non-zero Z is why beam lines weren't being drawn). Returns None if the
+        element could not be placed."""
         e = doc.GetElement(eid)
         if e is None:
             return None
         loc = e.Location
 
-        # Column (and any point-located element): align the family's CENTRE-LINE
-        # REFERENCE (Center Left/Right + Front/Back), which is what a dimension
-        # snaps to - not the insertion point and not the solid centroid, either
-        # of which can sit slightly off the reference. Place that reference on
-        # the rounded line(s), then shift the insertion point by the same vector.
+        def flat(p):
+            return XYZ(p.X, p.Y, 0.0)
+
+        # Column / point element: align the family's CENTRE-LINE reference
+        # (Center Left/Right + Front/Back) - what a dimension snaps to, not the
+        # insertion point nor the solid centroid. Place that reference on the
+        # rounded line(s), then shift the insertion point by the same vector.
         if isinstance(loc, LocationPoint):
             p = loc.Point
             ref = self._column_ref_center(e)
@@ -998,14 +1000,14 @@ class MainWin(object):
                     newc = self._column_ref_center(ne)
                     if newc is None:
                         newc = self._column_center(ne)
-                    if newc is not None:
-                        return newc
-                return self._elem_point(doc.GetElement(eid))
+                    anchor = newc if newc is not None else target
+                    return [(flat(anchor), gd) for (go, gd, tmm, mv) in glist]
             except:
-                pass   # fall back to the move loop below
+                pass
+            return None
 
         # Wall: project its centerline endpoints onto the rounded line.
-        elif isinstance(e, Wall) and isinstance(loc, LocationCurve):
+        if isinstance(e, Wall) and isinstance(loc, LocationCurve):
             try:
                 cur = loc.Curve
                 a = cur.GetEndPoint(0)
@@ -1018,30 +1020,52 @@ class MainWin(object):
                     mid = self._project_onto(mid, perp, c)
                 loc.Curve = Line.CreateBound(a, b)
                 doc.Regenerate()
-                return self._elem_point(doc.GetElement(eid))
+                return [(flat(mid), gd) for (go, gd, tmm, mv) in glist]
             except:
-                pass   # fall back to the move loop below
+                pass
 
-        # Beam / other element: a beam's two snaps are both rigid translations -
-        # sideways for the grid parallel to it, lengthwise for the grid
-        # perpendicular to it - so it needs the SAME exact 2x2 solve as a column.
-        # The constraints are rebuilt from each precomputed mv, which was
-        # measured from the correct reference point (the midpoint for the
-        # parallel grid, the relevant END for a perpendicular grid). Summing the
-        # two moves would leave a residual when the grids aren't perpendicular;
-        # the 2x2 solve makes both dimensions exact.
-        cons = []
-        for go, gd, tmm, mv in glist:
-            if mv is None:
-                continue
-            L = mv.GetLength()
-            if L < 1e-12:
-                continue
-            cons.append((XYZ(mv.X / L, mv.Y / L, 0), L))
-        if cons:
-            ElementTransformUtils.MoveElement(doc, eid, self._solve_move(cons))
-            doc.Regenerate()
-        return self._elem_point(doc.GetElement(eid))
+        # Beam / other curve element: a beam's two snaps are both rigid
+        # translations - sideways for the grid parallel to it, lengthwise for the
+        # grid perpendicular to it - so it needs the SAME exact 2x2 solve as a
+        # column. Constraints are rebuilt from each precomputed mv (measured from
+        # the correct reference point: midpoint for the parallel grid, the
+        # relevant END for a perpendicular grid). The reference line is then
+        # drawn through the midpoint (parallel grid) or the END (perpendicular
+        # grid) so it sits exactly where the dimension is taken.
+        if isinstance(loc, LocationCurve):
+            cur = loc.Curve
+            a = cur.GetEndPoint(0)
+            b = cur.GetEndPoint(1)
+            bdir = line_dir_2d(a, b)
+            cons = []
+            for go, gd, tmm, mv in glist:
+                if mv is None:
+                    continue
+                L = mv.GetLength()
+                if L < 1e-12:
+                    continue
+                cons.append((XYZ(mv.X / L, mv.Y / L, 0), L))
+            mvec = self._solve_move(cons) if cons else XYZ(0, 0, 0)
+            try:
+                if mvec.GetLength() > 1e-12:
+                    ElementTransformUtils.MoveElement(doc, eid, mvec)
+                    doc.Regenerate()
+            except:
+                return None
+            na = XYZ(a.X + mvec.X, a.Y + mvec.Y, a.Z)
+            nb = XYZ(b.X + mvec.X, b.Y + mvec.Y, b.Z)
+            nmid = XYZ((na.X + nb.X) / 2.0, (na.Y + nb.Y) / 2.0, na.Z)
+            anchors = []
+            for go, gd, tmm, mv in glist:
+                if bdir is not None and is_parallel(bdir, gd):
+                    anchors.append((flat(nmid), gd))
+                elif abs(signed_perp(go, gd, a)) <= abs(signed_perp(go, gd, b)):
+                    anchors.append((flat(na), gd))
+                else:
+                    anchors.append((flat(nb), gd))
+            return anchors
+
+        return None
 
     def _apply(self, s, a):
         todo = [i for i in self.items if i.sel]
@@ -1072,15 +1096,15 @@ class MainWin(object):
             for eid_int, glist in glist_by_id.items():
                 try:
                     eid = ElementId(eid_int)
-                    pf = self._align_element(eid, glist)
-                    if pf is None:
+                    anchors = self._align_element(eid, glist)
+                    if anchors is None:
                         fail += 1
                         continue
                     ok += 1
-                    # Draw the rounded grid line(s) through the final position.
+                    # Draw the rounded reference line through each anchor.
                     if draw:
-                        for go, gd, tmm, mv in glist:
-                            if self._draw_ref_line(view, pf, gd):
+                        for pt, gd in anchors:
+                            if self._draw_ref_line(view, pt, gd):
                                 lines += 1
                 except:
                     fail += 1
