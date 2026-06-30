@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Snap to Grid v21 - Round wall/column/beam distances to nearest gridline.
+"""Snap to Grid v22 - Round wall/column/beam distances to nearest gridline.
 
 The snap/align works in any view. The optional rounded reference line is 2D
 detail annotation, so it is only drawn in 2D views (plan/section/elevation/
@@ -1022,18 +1022,24 @@ class MainWin(object):
             except:
                 pass   # fall back to the move loop below
 
-        # Fallback (beams, odd cases): apply the SUM of the precomputed
-        # per-constraint moves. Each mv was measured at scan time from the right
-        # reference point (the beam midpoint for its parallel grid, the relevant
-        # END for a perpendicular grid), so it must be used as-is. Recomputing a
-        # perpendicular-grid distance from the midpoint here would be wrong by
-        # roughly half the beam length and fling the beam away.
-        total = XYZ(0, 0, 0)
+        # Beam / other element: a beam's two snaps are both rigid translations -
+        # sideways for the grid parallel to it, lengthwise for the grid
+        # perpendicular to it - so it needs the SAME exact 2x2 solve as a column.
+        # The constraints are rebuilt from each precomputed mv, which was
+        # measured from the correct reference point (the midpoint for the
+        # parallel grid, the relevant END for a perpendicular grid). Summing the
+        # two moves would leave a residual when the grids aren't perpendicular;
+        # the 2x2 solve makes both dimensions exact.
+        cons = []
         for go, gd, tmm, mv in glist:
-            if mv is not None:
-                total = XYZ(total.X + mv.X, total.Y + mv.Y, total.Z + mv.Z)
-        if total.GetLength() > 1e-12:
-            ElementTransformUtils.MoveElement(doc, eid, total)
+            if mv is None:
+                continue
+            L = mv.GetLength()
+            if L < 1e-12:
+                continue
+            cons.append((XYZ(mv.X / L, mv.Y / L, 0), L))
+        if cons:
+            ElementTransformUtils.MoveElement(doc, eid, self._solve_move(cons))
             doc.Regenerate()
         return self._elem_point(doc.GetElement(eid))
 
