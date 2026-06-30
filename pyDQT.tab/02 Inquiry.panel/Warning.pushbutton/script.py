@@ -49,6 +49,19 @@ DQT_TEXT = Color.FromRgb(51, 51, 51)           # #333333
 IDENTICAL_INSTANCES_KEY_PHRASE = "identical instances in the same place"
 IDENTICAL_INSTANCES_DISPLAY_TEXT = "There are identical instances in the same place. This will result in double counting in schedules."
 
+
+def id_val(eid):
+    """ElementId integer value, version-safe. Revit 2026 removed
+    ElementId.IntegerValue in favour of .Value (a System.Int64)."""
+    try:
+        return eid.Value
+    except:
+        try:
+            return eid.IntegerValue
+        except:
+            return -1
+
+
 class WarningManager(Window):
     def is_identical_instances_warning(self, warning_data):
         """Check if warning is the identical instances type we can auto-fix"""
@@ -2609,7 +2622,7 @@ class WarningManager(Window):
                 # Data rows
                 for idx, warning in enumerate(self.all_warnings, 1):
                     row = idx + 1
-                    element_ids = ",".join([str(eid.IntegerValue) for eid in warning['ElementIds']])
+                    element_ids = ",".join([str(id_val(eid)) for eid in warning['ElementIds']])
                     
                     ws.Cells[row, 1].Value2 = idx
                     ws.Cells[row, 2].Value2 = warning['Severity']
@@ -2757,7 +2770,7 @@ class WarningManager(Window):
                     cell.border = border
                 
                 for idx, warning in enumerate(self.all_warnings, 1):
-                    element_ids = ",".join([str(eid.IntegerValue) for eid in warning['ElementIds']])
+                    element_ids = ",".join([str(id_val(eid)) for eid in warning['ElementIds']])
                     
                     row_data = [
                         idx,
@@ -2863,7 +2876,7 @@ class WarningManager(Window):
                     writer.writerow(['No.', 'Severity', 'Category', 'Description', 'Element Count', 'View', 'Element IDs'])
                     
                     for idx, warning in enumerate(self.all_warnings, 1):
-                        element_ids = ",".join([str(eid.IntegerValue) for eid in warning['ElementIds']])
+                        element_ids = ",".join([str(id_val(eid)) for eid in warning['ElementIds']])
                         writer.writerow([
                             idx,
                             warning['Severity'],
@@ -2973,53 +2986,86 @@ class WarningManager(Window):
         
         forms.alert(result_msg, title="Warning Manager")
     
-    def count_related_elements(self, element_id):
-        """Count number of elements related to an element"""
-        count = 0
-        
-        # Count dimensions
-        dim_collector = DB.FilteredElementCollector(self.doc).OfClass(DB.Dimension)
-        for dim in dim_collector:
+    def get_impact_details(self, element_id):
+        """What gets affected if this element is deleted: dimensions that
+        reference it, tags placed on it, and nearby text notes. Returns a dict
+        with counts and a total."""
+        dims = 0
+        tags = 0
+        notes = 0
+
+        # Dimensions referencing the element
+        for dim in DB.FilteredElementCollector(self.doc).OfClass(DB.Dimension):
             try:
                 references = dim.References
                 if references:
                     for ref in references:
                         if ref.ElementId == element_id:
-                            count += 1
+                            dims += 1
                             break
             except:
                 pass
-        
-        # Count tags
-        tag_collector = DB.FilteredElementCollector(self.doc).OfClass(DB.IndependentTag)
-        for tag in tag_collector:
+
+        # Tags placed on the element (multi-reference / version safe)
+        for tag in DB.FilteredElementCollector(self.doc).OfClass(DB.IndependentTag):
             try:
-                if tag.TaggedLocalElementId == element_id:
-                    count += 1
+                tagged = False
+                try:
+                    for ti in tag.GetTaggedLocalElementIds():
+                        if ti == element_id:
+                            tagged = True
+                            break
+                except:
+                    tagged = (tag.TaggedLocalElementId == element_id)
+                if tagged:
+                    tags += 1
             except:
                 pass
-        
-        # Count text notes near element
-        text_note_collector = DB.FilteredElementCollector(self.doc).OfClass(DB.TextNote)
+
+        # Text notes near the element (heuristic)
         element_obj = self.doc.GetElement(element_id)
         if element_obj and hasattr(element_obj, 'Location'):
             try:
                 element_loc = element_obj.Location
                 if isinstance(element_loc, DB.LocationPoint):
                     element_point = element_loc.Point
-                    for text_note in text_note_collector:
+                    for text_note in DB.FilteredElementCollector(
+                            self.doc).OfClass(DB.TextNote):
                         try:
-                            text_point = text_note.Coord
-                            distance = element_point.DistanceTo(text_point)
-                            if distance < 2.0:
-                                count += 1
+                            if element_point.DistanceTo(text_note.Coord) < 2.0:
+                                notes += 1
                         except:
                             pass
             except:
                 pass
-        
-        return count
-    
+
+        return {'dimensions': dims, 'tags': tags, 'textnotes': notes,
+                'total': dims + tags + notes}
+
+    def count_related_elements(self, element_id):
+        """Count number of elements related to an element"""
+        return self.get_impact_details(element_id)['total']
+
+    def impact_message(self, element_id):
+        """Human-readable warning of what deleting this element will affect."""
+        d = self.get_impact_details(element_id)
+        if d['total'] == 0:
+            return ("No dimensions, tags or text notes reference this "
+                    "element - safe to delete.")
+        lines = ["Deleting this element will also affect:"]
+        if d['dimensions']:
+            lines.append(
+                "  - {} dimension(s) referencing it "
+                "(each may be removed or lose a segment)".format(d['dimensions']))
+        if d['tags']:
+            lines.append(
+                "  - {} tag(s) on it (these will be DELETED)".format(d['tags']))
+        if d['textnotes']:
+            lines.append(
+                "  - {} text note(s) nearby (may relate to it)".format(
+                    d['textnotes']))
+        return "\n".join(lines)
+
     def review_single_duplicate(self, warning_data):
         """Review single duplicate warning"""
         warning = warning_data['WarningObject']
@@ -3132,7 +3178,7 @@ class WarningManager(Window):
                 list_item = ListBoxItem()
                 list_item.Content = "{} - ID: {} - {}".format(
                     element.Name if hasattr(element, 'Name') else "Unknown",
-                    elem_id.IntegerValue,
+                    id_val(elem_id),
                     element.Category.Name if element.Category else "Unknown"
                 )
                 list_item.Tag = elem_id
@@ -3191,8 +3237,10 @@ class WarningManager(Window):
             return
         
         result = forms.alert(
-            "Are you sure you want to delete this element?\n\nElement to delete: ID {}\nElements to keep: {}".format(
-                element_id_to_delete.IntegerValue, len(elements_to_keep)),
+            "Are you sure you want to delete this element?\n\n" +
+            "Element to delete: ID {}\n".format(id_val(element_id_to_delete)) +
+            "Elements to keep: {}\n\n".format(len(elements_to_keep)) +
+            self.impact_message(element_id_to_delete),
             title="Confirm Deletion",
             options=["Confirm Delete", "Cancel"]
         )
@@ -3207,12 +3255,12 @@ class WarningManager(Window):
                     # Log to history
                     self.add_to_history(
                         "Delete Duplicate",
-                        "Deleted element ID {} (simple)".format(element_id_to_delete.IntegerValue),
+                        "Deleted element ID {} (simple)".format(id_val(element_id_to_delete)),
                         element_count=1,
                         success=True
                     )
                     
-                    forms.alert("Element deleted successfully!\n\nElement ID: {}".format(element_id_to_delete.IntegerValue), title="Warning Manager")
+                    forms.alert("Element deleted successfully!\n\nElement ID: {}".format(id_val(element_id_to_delete)), title="Warning Manager")
                     dialog.Close()
                     
                     # Save current filter state (including group)
@@ -3346,7 +3394,7 @@ class WarningManager(Window):
             name_label.Foreground = SolidColorBrush(DQT_TEXT)
             
             cat_label = Label()
-            cat_label.Content = "{} - ID: {}".format(elem_info['category'], elem_info['element_id'].IntegerValue)
+            cat_label.Content = "{} - ID: {}".format(elem_info['category'], id_val(elem_info['element_id']))
             cat_label.Foreground = Brushes.Gray
             cat_label.FontSize = 10
             
@@ -3447,12 +3495,11 @@ class WarningManager(Window):
             forms.alert("Cannot delete all elements. Must keep at least one element.", title="Warning Manager")
             return
         
-        related_count = self.count_related_elements(element_id_to_delete)
         result = forms.alert(
             "Are you sure you want to delete this element?\n\n" +
-            "Element to delete: ID {}\n".format(element_id_to_delete.IntegerValue) +
-            "Elements to keep: {}\n".format(len(elements_to_keep)) +
-            "Related elements affected: {}".format(related_count),
+            "Element to delete: ID {}\n".format(id_val(element_id_to_delete)) +
+            "Elements to keep: {}\n\n".format(len(elements_to_keep)) +
+            self.impact_message(element_id_to_delete),
             title="Confirm Deletion",
             options=["Confirm Delete", "Cancel"]
         )
@@ -3467,7 +3514,7 @@ class WarningManager(Window):
                     # Log to history
                     self.add_to_history(
                         "Delete Duplicate",
-                        "Deleted element ID {}".format(element_id_to_delete.IntegerValue),
+                        "Deleted element ID {}".format(id_val(element_id_to_delete)),
                         element_count=1,
                         success=True
                     )
@@ -3944,7 +3991,7 @@ class WarningManager(Window):
         element_ids = warning_data['ElementIds']
         
         if element_ids:
-            ids_text = ", ".join([str(eid.IntegerValue) for eid in element_ids])
+            ids_text = ", ".join([str(id_val(eid)) for eid in element_ids])
             System.Windows.Forms.Clipboard.SetText(ids_text)
             forms.alert("Copied {} element IDs to clipboard".format(len(element_ids)), title="Warning Manager")
     
@@ -4030,7 +4077,7 @@ class WarningManager(Window):
             all_element_ids.extend(warning.get('ElementIds', []))
         
         if all_element_ids:
-            ids_text = ", ".join([str(eid.IntegerValue) for eid in all_element_ids])
+            ids_text = ", ".join([str(id_val(eid)) for eid in all_element_ids])
             System.Windows.Forms.Clipboard.SetText(ids_text)
             forms.alert("Copied {} element IDs to clipboard".format(len(all_element_ids)), title="Warning Manager")
     
