@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Snap to Grid v23 - Round wall/column/beam distances to nearest gridline.
+"""Snap to Grid v24 - Round wall/column/beam distances to nearest gridline.
 
 The snap/align works in any view. The optional rounded reference line is 2D
 detail annotation, so it is only drawn in 2D views (plan/section/elevation/
@@ -1037,13 +1037,33 @@ class MainWin(object):
             a = cur.GetEndPoint(0)
             b = cur.GetEndPoint(1)
             bdir = line_dir_2d(a, b)
+
+            # A rigid beam translation can satisfy at most one SIDEWAYS
+            # constraint (the grid parallel to it) plus one LENGTHWISE constraint
+            # (a grid perpendicular to it, snapping one end). Two perpendicular
+            # grids would try to round BOTH ends, which is impossible by
+            # translation - so keep the parallel grid and only the single
+            # nearest perpendicular grid.
+            par = None
+            perp = None
+            perp_dist = None
+            for c in glist:
+                go, gd, tmm, mv = c
+                if mv is None or mv.GetLength() < 1e-12:
+                    continue
+                if bdir is not None and is_parallel(bdir, gd):
+                    par = c
+                else:
+                    d = min(abs(signed_perp(go, gd, a)),
+                            abs(signed_perp(go, gd, b)))
+                    if perp_dist is None or d < perp_dist:
+                        perp_dist = d
+                        perp = c
+            chosen = [c for c in (par, perp) if c is not None]
+
             cons = []
-            for go, gd, tmm, mv in glist:
-                if mv is None:
-                    continue
+            for go, gd, tmm, mv in chosen:
                 L = mv.GetLength()
-                if L < 1e-12:
-                    continue
                 cons.append((XYZ(mv.X / L, mv.Y / L, 0), L))
             mvec = self._solve_move(cons) if cons else XYZ(0, 0, 0)
             try:
@@ -1052,17 +1072,23 @@ class MainWin(object):
                     doc.Regenerate()
             except:
                 return None
+
             na = XYZ(a.X + mvec.X, a.Y + mvec.Y, a.Z)
             nb = XYZ(b.X + mvec.X, b.Y + mvec.Y, b.Z)
             nmid = XYZ((na.X + nb.X) / 2.0, (na.Y + nb.Y) / 2.0, na.Z)
             anchors = []
-            for go, gd, tmm, mv in glist:
+            for go, gd, tmm, mv in chosen:
+                # Anchor exactly on the rounded line (project), so the drawn
+                # reference line is always a whole number even if a join keeps
+                # the beam from fully reaching it.
                 if bdir is not None and is_parallel(bdir, gd):
-                    anchors.append((flat(nmid), gd))
-                elif abs(signed_perp(go, gd, a)) <= abs(signed_perp(go, gd, b)):
-                    anchors.append((flat(na), gd))
+                    ref = nmid
+                elif abs(signed_perp(go, gd, na)) <= abs(signed_perp(go, gd, nb)):
+                    ref = na
                 else:
-                    anchors.append((flat(nb), gd))
+                    ref = nb
+                perpv, c = self._line_const(go, gd, ref, tmm)
+                anchors.append((flat(self._project_onto(ref, perpv, c)), gd))
             return anchors
 
         return None
