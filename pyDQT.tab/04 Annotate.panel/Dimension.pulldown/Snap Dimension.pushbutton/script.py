@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Snap to Grid v24 - Round wall/column/beam distances to nearest gridline.
+"""Snap to Grid v25 - Round wall/column/beam distances to nearest gridline.
 
 The snap/align works in any view. The optional rounded reference line is 2D
 detail annotation, so it is only drawn in 2D views (plan/section/elevation/
@@ -1024,26 +1024,21 @@ class MainWin(object):
             except:
                 pass
 
-        # Beam / other curve element: a beam's two snaps are both rigid
-        # translations - sideways for the grid parallel to it, lengthwise for the
-        # grid perpendicular to it - so it needs the SAME exact 2x2 solve as a
-        # column. Constraints are rebuilt from each precomputed mv (measured from
-        # the correct reference point: midpoint for the parallel grid, the
-        # relevant END for a perpendicular grid). The reference line is then
-        # drawn through the midpoint (parallel grid) or the END (perpendicular
-        # grid) so it sits exactly where the dimension is taken.
-        if isinstance(loc, LocationCurve):
+        # Beam (straight): put the WHOLE centreline onto the rounded line, like
+        # a wall - not just a translation that only rounds the midpoint.
+        #  1) grid PARALLEL to the beam: project BOTH ends onto its rounded line,
+        #     so the beam becomes parallel to the grid at the rounded distance
+        #     (rounded all along, not only at the centre).
+        #  2) grid PERPENDICULAR to the beam: slide the beam along its own
+        #     (now parallel) axis so the nearest end lands on the rounded line -
+        #     this keeps the beam on the parallel line and preserves its length.
+        # Only one perpendicular grid is used (two ends can't both be rounded).
+        if isinstance(loc, LocationCurve) and isinstance(loc.Curve, Line):
             cur = loc.Curve
             a = cur.GetEndPoint(0)
             b = cur.GetEndPoint(1)
             bdir = line_dir_2d(a, b)
 
-            # A rigid beam translation can satisfy at most one SIDEWAYS
-            # constraint (the grid parallel to it) plus one LENGTHWISE constraint
-            # (a grid perpendicular to it, snapping one end). Two perpendicular
-            # grids would try to round BOTH ends, which is impossible by
-            # translation - so keep the parallel grid and only the single
-            # nearest perpendicular grid.
             par = None
             perp = None
             perp_dist = None
@@ -1060,10 +1055,65 @@ class MainWin(object):
                         perp_dist = d
                         perp = c
             chosen = [c for c in (par, perp) if c is not None]
+            if not chosen:
+                return []
 
-            cons = []
+            try:
+                # 1) rotate/shift the beam onto the parallel rounded line.
+                if par is not None:
+                    go, gd, tmm, mv = par
+                    mid = XYZ((a.X + b.X) / 2.0, (a.Y + b.Y) / 2.0, a.Z)
+                    perpv, cc = self._line_const(go, gd, mid, tmm)
+                    a = self._project_onto(a, perpv, cc)
+                    b = self._project_onto(b, perpv, cc)
+                # 2) slide along the axis so the nearest end rounds to the
+                #    perpendicular grid.
+                if perp is not None:
+                    go, gd, tmm, mv = perp
+                    bd2 = line_dir_2d(a, b)
+                    if bd2 is not None:
+                        end = a if abs(signed_perp(go, gd, a)) <= \
+                            abs(signed_perp(go, gd, b)) else b
+                        sd = signed_perp(go, gd, end)
+                        s = 1.0 if sd >= 0 else -1.0
+                        tgt = s * (tmm / FEET_TO_MM)
+                        perp_gd = XYZ(gd.Y, -gd.X, 0)
+                        denom = bd2.X * perp_gd.X + bd2.Y * perp_gd.Y
+                        if abs(denom) > 1e-9:
+                            t = (tgt - sd) / denom
+                            a = XYZ(a.X + bd2.X * t, a.Y + bd2.Y * t, a.Z)
+                            b = XYZ(b.X + bd2.X * t, b.Y + bd2.Y * t, b.Z)
+                loc.Curve = Line.CreateBound(a, b)
+                doc.Regenerate()
+            except:
+                return None
+
+            nmid = XYZ((a.X + b.X) / 2.0, (a.Y + b.Y) / 2.0, a.Z)
+            anchors = []
             for go, gd, tmm, mv in chosen:
+                if bdir is not None and is_parallel(bdir, gd):
+                    ref = nmid
+                elif abs(signed_perp(go, gd, a)) <= abs(signed_perp(go, gd, b)):
+                    ref = a
+                else:
+                    ref = b
+                perpv, c = self._line_const(go, gd, ref, tmm)
+                anchors.append((flat(self._project_onto(ref, perpv, c)), gd))
+            return anchors
+
+        # Non-line beam / other curve element: rigid 2x2 translation fallback.
+        if isinstance(loc, LocationCurve):
+            cur = loc.Curve
+            a = cur.GetEndPoint(0)
+            b = cur.GetEndPoint(1)
+            bdir = line_dir_2d(a, b)
+            cons = []
+            for go, gd, tmm, mv in glist:
+                if mv is None:
+                    continue
                 L = mv.GetLength()
+                if L < 1e-12:
+                    continue
                 cons.append((XYZ(mv.X / L, mv.Y / L, 0), L))
             mvec = self._solve_move(cons) if cons else XYZ(0, 0, 0)
             try:
@@ -1072,15 +1122,11 @@ class MainWin(object):
                     doc.Regenerate()
             except:
                 return None
-
             na = XYZ(a.X + mvec.X, a.Y + mvec.Y, a.Z)
             nb = XYZ(b.X + mvec.X, b.Y + mvec.Y, b.Z)
             nmid = XYZ((na.X + nb.X) / 2.0, (na.Y + nb.Y) / 2.0, na.Z)
             anchors = []
-            for go, gd, tmm, mv in chosen:
-                # Anchor exactly on the rounded line (project), so the drawn
-                # reference line is always a whole number even if a join keeps
-                # the beam from fully reaching it.
+            for go, gd, tmm, mv in glist:
                 if bdir is not None and is_parallel(bdir, gd):
                     ref = nmid
                 elif abs(signed_perp(go, gd, na)) <= abs(signed_perp(go, gd, nb)):
