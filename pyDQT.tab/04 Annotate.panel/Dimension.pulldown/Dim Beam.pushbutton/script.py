@@ -145,6 +145,39 @@ def get_all_dimension_types():
 #  BEAM REFERENCES
 # =====================================================================
 
+def _collect_line_ref(geo, best):
+    """Recurse geometry, keeping the longest Line that carries a Reference
+    (the beam's centreline). best = [reference, length]."""
+    if geo is None:
+        return
+    for g in geo:
+        try:
+            if isinstance(g, Line) and g.Reference is not None:
+                L = g.Length
+                if best[0] is None or L > best[1]:
+                    best[0] = g.Reference
+                    best[1] = L
+            elif isinstance(g, GeometryInstance):
+                _collect_line_ref(g.GetInstanceGeometry(), best)
+        except:
+            continue
+
+
+def _get_beam_centerline_ref(beam):
+    """Dimensionable reference to the beam centreline, from its non-visible
+    reference line (works when CenterLeftRight isn't exposed by the family)."""
+    try:
+        opts = Options()
+        opts.ComputeReferences = True
+        opts.IncludeNonVisibleObjects = True
+        geo = beam.get_Geometry(opts)
+        best = [None, 0.0]
+        _collect_line_ref(geo, best)
+        return best[0]
+    except:
+        return None
+
+
 def get_beam_refs(beam, view, geom):
     """Return references keyed: 'left'/'right' (side faces, normal along bp),
     'start'/'end' (end faces, normal along bd), 'center' (centreline). Plus
@@ -152,13 +185,19 @@ def get_beam_refs(beam, view, geom):
     refs = {}
     sizes = {'width': 0.0, 'length': geom['len']}
 
-    # Centreline reference (along the length).
+    # Centreline reference (along the length). Many framing families don't
+    # expose CenterLeftRight, so fall back to the beam's non-visible reference
+    # line (the actual centreline curve carries a dimensionable reference).
     try:
         cl = beam.GetReferences(FamilyInstanceReferenceType.CenterLeftRight)
         if cl and cl.Count > 0:
             refs['center'] = cl[0]
     except:
         pass
+    if 'center' not in refs:
+        cref = _get_beam_centerline_ref(beam)
+        if cref is not None:
+            refs['center'] = cref
 
     # Try the built-in side/end references first.
     tmap = {
@@ -416,7 +455,11 @@ def _dim_to_parallel(beam, view, ref, geom, off_along, off_extra, dt_id, tag):
 
 def create_dim_center_to_grid(beam, view, refs, geom, off, dt_id):
     if 'center' not in refs:
-        return [], ["no centre ref"]
+        # No dimensionable centreline on this family - fall back to the nearest
+        # side face so a grid dimension is still produced.
+        created, errs = create_dim_face_to_grid(beam, view, refs, geom,
+                                                off, dt_id)
+        return created, errs + ["centre ref unavailable - used nearest face"]
     return _dim_to_parallel(beam, view, refs['center'], geom,
                             0.0, off * 2.0, dt_id, "CtrGrid")
 
