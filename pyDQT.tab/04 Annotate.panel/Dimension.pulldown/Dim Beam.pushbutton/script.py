@@ -422,9 +422,10 @@ def create_dim_width(beam, view, refs, geom, sizes, off, dt_id):
     return created, errs
 
 
-def _dim_to_parallel(beam, view, ref, geom, off_along, off_extra, dt_id, tag):
+def _dim_to_parallel(beam, view, ref, geom, off, off_extra, dt_id, tag):
     """Dim a beam reference (centre or a side face) to the nearest parallel
-    grid, measured across the beam (along bp)."""
+    grid, measured across the beam (along bp). off = dim-line margin,
+    off_extra = shift along the beam so stacked dims don't overlap."""
     created, errs = [], []
     bd, bp, mid = geom['bd'], geom['bp'], geom['mid']
     par, _ = find_beam_grids(view=view, geom=geom)
@@ -461,7 +462,7 @@ def create_dim_center_to_grid(beam, view, refs, geom, off, dt_id):
                                                 off, dt_id)
         return created, errs + ["centre ref unavailable - used nearest face"]
     return _dim_to_parallel(beam, view, refs['center'], geom,
-                            0.0, off * 2.0, dt_id, "CtrGrid")
+                            off, off * 2.0, dt_id, "CtrGrid")
 
 
 def create_dim_face_to_grid(beam, view, refs, geom, off, dt_id):
@@ -476,7 +477,7 @@ def create_dim_face_to_grid(beam, view, refs, geom, off, dt_id):
     if face_key not in refs:
         return [], ["no side face ref"]
     return _dim_to_parallel(beam, view, refs[face_key], geom,
-                            0.0, off * 3.5, dt_id, "FaceGrid")
+                            off, off * 3.5, dt_id, "FaceGrid")
 
 
 def create_dim_end_to_grid(beam, view, refs, geom, off, dt_id):
