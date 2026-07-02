@@ -27,10 +27,11 @@ from Autodesk.Revit.DB import (
     Transaction, FilteredElementCollector,
     BuiltInCategory, BuiltInParameter,
     Options, Solid, PlanarFace, Line, XYZ,
-    ReferenceArray, ElementId,
+    ReferenceArray, ElementId, ElementTransformUtils,
     FamilyInstance, FamilyInstanceReferenceType,
     LocationCurve, Grid, Reference,
-    GeometryInstance, DimensionType
+    GeometryInstance, DimensionType,
+    Dimension, IndependentTag, TextNote
 )
 from Autodesk.Revit.UI.Selection import ObjectType, ISelectionFilter
 from pyrevit import revit, forms, script
@@ -385,12 +386,74 @@ def find_beam_grids(geom, view):
 #  DIMENSION CREATION
 # =====================================================================
 
-def make_dim(view, line, ref_array, dim_type_id=None):
+# Occupied annotation bounding boxes (set in main() when overlap-avoidance is
+# on, else None). New dimensions are nudged clear of these and then added.
+_OCCUPIED = None
+
+
+def _bbox_overlap(a, b, pad=0.0):
+    return not (a.Max.X + pad < b.Min.X or a.Min.X - pad > b.Max.X or
+                a.Max.Y + pad < b.Min.Y or a.Min.Y - pad > b.Max.Y)
+
+
+def collect_anno_boxes(view):
+    """View bounding boxes of existing dimensions, tags and text notes (grids
+    are excluded - they span the whole view)."""
+    boxes = []
+    for cls in (Dimension, IndependentTag, TextNote):
+        try:
+            for e in FilteredElementCollector(doc, view.Id).OfClass(cls):
+                try:
+                    bb = e.get_BoundingBox(view)
+                    if bb is not None:
+                        boxes.append(bb)
+                except:
+                    pass
+        except:
+            pass
+    return boxes
+
+
+def _avoid_overlap(dim, line, anchor, view):
+    """Nudge a freshly created dimension perpendicular to its line, away from
+    the member (anchor), until it clears everything already placed, then record
+    it so later dimensions stack instead of piling up."""
+    if _OCCUPIED is None:
+        return
+    try:
+        d = line.Direction
+        perp = XYZ(-d.Y, d.X, 0)
+        mid = line.Evaluate(0.5, True)
+        if (mid.X - anchor.X) * perp.X + (mid.Y - anchor.Y) * perp.Y < 0:
+            perp = XYZ(-perp.X, -perp.Y, 0)
+        step = 1.2   # ft (~365 mm) per nudge
+        for _ in range(15):
+            bb = dim.get_BoundingBox(view)
+            if bb is None:
+                break
+            if not any(_bbox_overlap(bb, ob) for ob in _OCCUPIED):
+                break
+            ElementTransformUtils.MoveElement(
+                doc, dim.Id, XYZ(perp.X * step, perp.Y * step, 0))
+            doc.Regenerate()
+        bb = dim.get_BoundingBox(view)
+        if bb is not None:
+            _OCCUPIED.append(bb)
+    except:
+        pass
+
+
+def make_dim(view, line, ref_array, dim_type_id=None, anchor=None):
+    dim = None
     if dim_type_id:
         dt = doc.GetElement(dim_type_id)
         if dt:
-            return doc.Create.NewDimension(view, line, ref_array, dt)
-    return doc.Create.NewDimension(view, line, ref_array)
+            dim = doc.Create.NewDimension(view, line, ref_array, dt)
+    if dim is None:
+        dim = doc.Create.NewDimension(view, line, ref_array)
+    if dim is not None and anchor is not None:
+        _avoid_overlap(dim, line, anchor, view)
+    return dim
 
 
 def _line(base, direction, half):
@@ -412,7 +475,7 @@ def create_dim_width(beam, view, refs, geom, sizes, off, dt_id):
     ra.Append(refs['left'])
     ra.Append(refs['right'])
     try:
-        d = make_dim(view, _line(base, bp, half), ra, dt_id)
+        d = make_dim(view, _line(base, bp, half), ra, dt_id, anchor=base)
         if d:
             created.append(d.Id)
     except Exception as ex:
@@ -444,7 +507,7 @@ def _dim_to_parallel(beam, view, ref, geom, off, off_extra, dt_id, tag):
               mid.Y + bp.Y * (sd / 2.0) + bd.Y * off_extra, mid.Z)
     half = ad / 2.0 + off + 1.0
     try:
-        d = make_dim(view, _line(cen, bp, half), ra, dt_id)
+        d = make_dim(view, _line(cen, bp, half), ra, dt_id, anchor=mid)
         if d:
             created.append(d.Id)
     except Exception as ex:
@@ -504,7 +567,7 @@ def create_dim_end_to_grid(beam, view, refs, geom, off, dt_id):
         base = XYZ(endpt.X + bp.X * off, endpt.Y + bp.Y * off, endpt.Z)
         half = best_d + 2.0
         try:
-            d = make_dim(view, _line(base, bd, half), ra, dt_id)
+            d = make_dim(view, _line(base, bd, half), ra, dt_id, anchor=endpt)
             if d:
                 created.append(d.Id)
         except Exception as ex:
@@ -620,7 +683,9 @@ class AutoDimBeamDialog(Window):
         self.txt_off = TextBox(); self.txt_off.Text = "500"
         self.txt_off.Width = 80; self.txt_off.FontSize = 12
         self.txt_off.Padding = Thickness(4, 2, 4, 2); op.Children.Add(self.txt_off)
-        m.Children.Add(self._cd([op]))
+        self.chk_avoid = self._cb(
+            "Avoid overlapping existing dimensions / tags / text", True)
+        m.Children.Add(self._cd([op, self.chk_avoid]))
 
         bp = StackPanel(); bp.Orientation = Orientation.Horizontal
         bp.HorizontalAlignment = HorizontalAlignment.Right
@@ -662,6 +727,7 @@ class AutoDimBeamDialog(Window):
             'f': self.chk_f.IsChecked == True,
             'c': self.chk_c.IsChecked == True,
             'e': self.chk_e.IsChecked == True,
+            'avoid': self.chk_avoid.IsChecked == True,
             'off': off,
             'dim_type_id': dim_type_id,
         }
@@ -720,6 +786,9 @@ def main():
     total = 0
     failed = []
     errors = []
+
+    global _OCCUPIED
+    _OCCUPIED = collect_anno_boxes(view) if r['avoid'] else None
 
     txn = Transaction(doc, "DQT - Auto Dimension Beams")
     txn.Start()
