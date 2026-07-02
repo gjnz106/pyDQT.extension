@@ -199,7 +199,16 @@ def get_beam_refs(beam, view, geom):
         if cref is not None:
             refs['center'] = cref
 
-    # Try the built-in side/end references first.
+    # Side/end faces: prefer the instance-qualified geometry references (these
+    # are the ones that reliably dimension in the view - same approach as the
+    # column tool). The FamilyInstanceReferenceType lookups are only a fallback,
+    # because for framing families Left/Right often return references that don't
+    # dimension in a plan view.
+    face_refs, face_sizes = _get_beam_face_refs(beam, view, geom)
+    for key in ('left', 'right', 'start', 'end'):
+        if key in face_refs:
+            refs[key] = face_refs[key]
+
     tmap = {
         'left':  FamilyInstanceReferenceType.Left,
         'right': FamilyInstanceReferenceType.Right,
@@ -207,6 +216,8 @@ def get_beam_refs(beam, view, geom):
         'end':   FamilyInstanceReferenceType.Back,
     }
     for key, rt in tmap.items():
+        if key in refs:
+            continue
         try:
             rl = beam.GetReferences(rt)
             if rl and rl.Count > 0:
@@ -214,20 +225,19 @@ def get_beam_refs(beam, view, geom):
         except:
             pass
 
-    # Geometry fallback (robust): classify faces by the beam's own axes.
-    face_refs, face_sizes = _get_beam_face_refs(beam, view, geom)
-    for key in ('left', 'right', 'start', 'end'):
-        if key not in refs and key in face_refs:
-            refs[key] = face_refs[key]
     if face_sizes.get('width'):
         sizes['width'] = face_sizes['width']
     return refs, sizes
 
 
 def _get_beam_face_refs(beam, view, geom):
-    """Instance-qualified face references from GetSymbolGeometry(), classified
-    in the beam's frame: normal ~ bp -> side (left/right); normal ~ bd ->
-    end (start/end)."""
+    """Dimensionable face references classified in the beam's frame:
+    normal ~ bp -> side (left/right, width); normal ~ bd -> end (start/end).
+
+    Classifies the SYMBOL faces (which stay intact and keep their references
+    even when the beam is cut at a join) using their normals transformed to
+    world by the instance transform - so it is robust to join-trimming, unlike
+    pairing instance faces to symbol faces by index."""
     opts = Options()
     opts.ComputeReferences = True
     opts.IncludeNonVisibleObjects = False
@@ -239,60 +249,47 @@ def _get_beam_face_refs(beam, view, geom):
     bd = geom['bd']
     bp = geom['bp']
 
-    inst_faces = []
-    sym_refs = []
+    side_faces = []   # normal ~ bp
+    end_faces = []    # normal ~ bd
     for gobj in geo:
         if not isinstance(gobj, GeometryInstance):
             continue
         try:
-            ig = gobj.GetInstanceGeometry()
+            xf = gobj.Transform
             sg = gobj.GetSymbolGeometry()
-            if not ig or not sg:
+            if not sg:
                 continue
-            isolids = [g for g in ig if isinstance(g, Solid) and g.Volume > 0]
-            ssolids = [g for g in sg if isinstance(g, Solid) and g.Volume > 0]
-            for si in range(min(len(isolids), len(ssolids))):
-                ifc = isolids[si].Faces.Size
-                sfc = ssolids[si].Faces.Size
-                if ifc != sfc:
+            for solid in sg:
+                if not isinstance(solid, Solid) or solid.Volume <= 0:
                     continue
-                for fi in range(ifc):
-                    iface = isolids[si].Faces.get_Item(fi)
-                    sface = ssolids[si].Faces.get_Item(fi)
-                    if not isinstance(iface, PlanarFace):
+                for fi in range(solid.Faces.Size):
+                    face = solid.Faces.get_Item(fi)
+                    if not isinstance(face, PlanarFace):
                         continue
-                    if not isinstance(sface, PlanarFace):
+                    if face.Reference is None:
                         continue
-                    if sface.Reference is None:
+                    wn = xf.OfVector(face.FaceNormal)
+                    ln = wn.GetLength()
+                    if ln < 1e-9:
                         continue
-                    n = iface.FaceNormal
-                    if abs(n.Z) > 0.1:          # skip top/bottom faces
+                    wn = XYZ(wn.X / ln, wn.Y / ln, wn.Z / ln)
+                    if abs(wn.Z) > 0.1:         # skip top/bottom faces
                         continue
                     try:
-                        sr = sface.Reference.ConvertToStableRepresentation(doc)
+                        sr = face.Reference.ConvertToStableRepresentation(doc)
                         if ":INSTANCE:" not in sr:
                             continue
                     except:
                         continue
-                    inst_faces.append((n, iface.Origin))
-                    sym_refs.append(sface.Reference)
+                    wo = xf.OfPoint(face.Origin)
+                    dp = abs(wn.DotProduct(bp))
+                    dd = abs(wn.DotProduct(bd))
+                    if dp > dd and dp > 0.7:
+                        side_faces.append((face.Reference, wn, wo))
+                    elif dd > dp and dd > 0.7:
+                        end_faces.append((face.Reference, wn, wo))
         except:
             continue
-
-    if len(sym_refs) < 2:
-        return {}, {}
-
-    side_faces = []   # normal ~ bp
-    end_faces = []    # normal ~ bd
-    for i in range(len(sym_refs)):
-        n, o = inst_faces[i]
-        r = sym_refs[i]
-        dp = abs(n.DotProduct(bp))
-        dd = abs(n.DotProduct(bd))
-        if dp > dd and dp > 0.7:
-            side_faces.append((r, n, o))
-        elif dd > dp and dd > 0.7:
-            end_faces.append((r, n, o))
 
     result = {}
     sizes = {}
@@ -405,7 +402,8 @@ def _line(base, direction, half):
 def create_dim_width(beam, view, refs, geom, sizes, off, dt_id):
     created, errs = [], []
     if 'left' not in refs or 'right' not in refs:
-        return created, errs
+        return created, ["Width: side face refs not found ({})".format(
+            list(refs.keys()))]
     bp = geom['bp']
     width = sizes.get('width', 0.0)
     half = (width / 2.0 if width > 0 else 1.0) + off
