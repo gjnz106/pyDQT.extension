@@ -1,0 +1,744 @@
+# -*- coding: utf-8 -*-
+"""Auto Dimension Beams
+Works for beams (Structural Framing) at any angle, in the beam's own frame:
+  1. Beam Width  : dim the two side faces (across the beam)
+  2. Face to Grid: nearest side face to the nearest grid parallel to the beam
+  3. Center to Grid: beam centreline to the nearest parallel grid
+  4. End to Grid : each beam end to the nearest grid perpendicular to the beam
+
+Copyright (c) 2025 Dang Quoc Truong (DQT)
+All rights reserved.
+"""
+
+__title__ = "Auto Dim\nBeams"
+__author__ = "Dang Quoc Truong (DQT)"
+__doc__ = "Auto dimension selected beams (any angle) in the active plan view."
+
+import clr
+clr.AddReference('RevitAPI')
+clr.AddReference('RevitAPIUI')
+clr.AddReference('PresentationCore')
+clr.AddReference('PresentationFramework')
+clr.AddReference('WindowsBase')
+clr.AddReference('System')
+
+import Autodesk.Revit.DB as DB
+from Autodesk.Revit.DB import (
+    Transaction, FilteredElementCollector,
+    BuiltInCategory, BuiltInParameter,
+    Options, Solid, PlanarFace, Line, XYZ,
+    ReferenceArray, ElementId,
+    FamilyInstance, FamilyInstanceReferenceType,
+    LocationCurve, Grid, Reference,
+    GeometryInstance, DimensionType
+)
+from Autodesk.Revit.UI.Selection import ObjectType, ISelectionFilter
+from pyrevit import revit, forms, script
+
+import System
+from System.Collections.Generic import List
+from System.Windows import (
+    Window, WindowStartupLocation, Thickness,
+    HorizontalAlignment, VerticalAlignment, TextWrapping,
+    FontWeights, CornerRadius, SizeToContent, ResizeMode
+)
+from System.Windows.Controls import (
+    StackPanel, Button, TextBlock, Border, CheckBox,
+    Orientation, ComboBox, ComboBoxItem, TextBox
+)
+from System.Windows.Media import SolidColorBrush, Color, Colors, FontFamily
+import math
+
+doc = __revit__.ActiveUIDocument.Document
+uidoc = __revit__.ActiveUIDocument
+active_view = doc.ActiveView
+
+DQT_PRIMARY   = Color.FromRgb(0xF0, 0xCC, 0x88)
+DQT_ACCENT    = Color.FromRgb(0xC8, 0x96, 0x50)
+DQT_BG        = Color.FromRgb(0xFE, 0xF8, 0xE7)
+DQT_DARK      = Color.FromRgb(0x3C, 0x3C, 0x3C)
+DQT_WHITE     = Colors.White
+DQT_BORDER    = Color.FromRgb(0xDD, 0xDD, 0xDD)
+DQT_TEXT_DARK = Color.FromRgb(0x33, 0x33, 0x33)
+
+MM = 304.8
+
+
+def B(color):
+    return SolidColorBrush(color)
+
+
+def _eid_int(eid):
+    try:
+        return eid.IntegerValue
+    except:
+        return eid.Value
+
+
+def _bic_int(bic):
+    return int(bic)
+
+
+BEAM_CAT_ID = _bic_int(BuiltInCategory.OST_StructuralFraming)
+
+
+def is_beam(elem):
+    if not isinstance(elem, FamilyInstance):
+        return False
+    cat = elem.Category
+    if cat is None:
+        return False
+    return _eid_int(cat.Id) == BEAM_CAT_ID
+
+
+class BeamSelectionFilter(ISelectionFilter):
+    def AllowElement(self, elem):
+        return is_beam(elem)
+
+    def AllowReference(self, reference, position):
+        return False
+
+
+# =====================================================================
+#  BEAM GEOMETRY (plan frame)
+# =====================================================================
+
+def get_beam_geom(beam):
+    """Plan frame of a straight beam: end points, midpoint, axis dir (bd) and
+    in-plane perpendicular (bp). None for non-straight beams."""
+    loc = beam.Location
+    if not isinstance(loc, LocationCurve):
+        return None
+    curve = loc.Curve
+    if not isinstance(curve, Line):
+        return None
+    p0 = curve.GetEndPoint(0)
+    p1 = curve.GetEndPoint(1)
+    dx, dy = p1.X - p0.X, p1.Y - p0.Y
+    ln = math.sqrt(dx * dx + dy * dy)
+    if ln < 1e-9:
+        return None
+    bd = XYZ(dx / ln, dy / ln, 0)
+    bp = XYZ(-bd.Y, bd.X, 0)
+    z = p0.Z
+    mid = XYZ((p0.X + p1.X) / 2.0, (p0.Y + p1.Y) / 2.0, z)
+    return {'p0': XYZ(p0.X, p0.Y, z), 'p1': XYZ(p1.X, p1.Y, z),
+            'mid': mid, 'bd': bd, 'bp': bp, 'len': ln, 'z': z}
+
+
+def get_all_dimension_types():
+    dim_types = []
+    for dt in FilteredElementCollector(doc).OfClass(DimensionType):
+        try:
+            if dt.StyleType == DB.DimensionStyleType.Linear:
+                name = dt.get_Parameter(
+                    BuiltInParameter.SYMBOL_NAME_PARAM).AsString()
+                if name:
+                    dim_types.append((name, dt.Id))
+        except:
+            continue
+    dim_types.sort(key=lambda x: x[0])
+    return dim_types
+
+
+# =====================================================================
+#  BEAM REFERENCES
+# =====================================================================
+
+def get_beam_refs(beam, view, geom):
+    """Return references keyed: 'left'/'right' (side faces, normal along bp),
+    'start'/'end' (end faces, normal along bd), 'center' (centreline). Plus
+    'width' and 'length' sizes (ft)."""
+    refs = {}
+    sizes = {'width': 0.0, 'length': geom['len']}
+
+    # Centreline reference (along the length).
+    try:
+        cl = beam.GetReferences(FamilyInstanceReferenceType.CenterLeftRight)
+        if cl and cl.Count > 0:
+            refs['center'] = cl[0]
+    except:
+        pass
+
+    # Try the built-in side/end references first.
+    tmap = {
+        'left':  FamilyInstanceReferenceType.Left,
+        'right': FamilyInstanceReferenceType.Right,
+        'start': FamilyInstanceReferenceType.Front,
+        'end':   FamilyInstanceReferenceType.Back,
+    }
+    for key, rt in tmap.items():
+        try:
+            rl = beam.GetReferences(rt)
+            if rl and rl.Count > 0:
+                refs[key] = rl[0]
+        except:
+            pass
+
+    # Geometry fallback (robust): classify faces by the beam's own axes.
+    face_refs, face_sizes = _get_beam_face_refs(beam, view, geom)
+    for key in ('left', 'right', 'start', 'end'):
+        if key not in refs and key in face_refs:
+            refs[key] = face_refs[key]
+    if face_sizes.get('width'):
+        sizes['width'] = face_sizes['width']
+    return refs, sizes
+
+
+def _get_beam_face_refs(beam, view, geom):
+    """Instance-qualified face references from GetSymbolGeometry(), classified
+    in the beam's frame: normal ~ bp -> side (left/right); normal ~ bd ->
+    end (start/end)."""
+    opts = Options()
+    opts.ComputeReferences = True
+    opts.IncludeNonVisibleObjects = False
+    opts.View = view
+    geo = beam.get_Geometry(opts)
+    if geo is None:
+        return {}, {}
+
+    bd = geom['bd']
+    bp = geom['bp']
+
+    inst_faces = []
+    sym_refs = []
+    for gobj in geo:
+        if not isinstance(gobj, GeometryInstance):
+            continue
+        try:
+            ig = gobj.GetInstanceGeometry()
+            sg = gobj.GetSymbolGeometry()
+            if not ig or not sg:
+                continue
+            isolids = [g for g in ig if isinstance(g, Solid) and g.Volume > 0]
+            ssolids = [g for g in sg if isinstance(g, Solid) and g.Volume > 0]
+            for si in range(min(len(isolids), len(ssolids))):
+                ifc = isolids[si].Faces.Size
+                sfc = ssolids[si].Faces.Size
+                if ifc != sfc:
+                    continue
+                for fi in range(ifc):
+                    iface = isolids[si].Faces.get_Item(fi)
+                    sface = ssolids[si].Faces.get_Item(fi)
+                    if not isinstance(iface, PlanarFace):
+                        continue
+                    if not isinstance(sface, PlanarFace):
+                        continue
+                    if sface.Reference is None:
+                        continue
+                    n = iface.FaceNormal
+                    if abs(n.Z) > 0.1:          # skip top/bottom faces
+                        continue
+                    try:
+                        sr = sface.Reference.ConvertToStableRepresentation(doc)
+                        if ":INSTANCE:" not in sr:
+                            continue
+                    except:
+                        continue
+                    inst_faces.append((n, iface.Origin))
+                    sym_refs.append(sface.Reference)
+        except:
+            continue
+
+    if len(sym_refs) < 2:
+        return {}, {}
+
+    side_faces = []   # normal ~ bp
+    end_faces = []    # normal ~ bd
+    for i in range(len(sym_refs)):
+        n, o = inst_faces[i]
+        r = sym_refs[i]
+        dp = abs(n.DotProduct(bp))
+        dd = abs(n.DotProduct(bd))
+        if dp > dd and dp > 0.7:
+            side_faces.append((r, n, o))
+        elif dd > dp and dd > 0.7:
+            end_faces.append((r, n, o))
+
+    result = {}
+    sizes = {}
+
+    result_pair = _outermost_pair(side_faces, bp)
+    if result_pair:
+        (rl, rr), dist = result_pair
+        result['left'] = rl
+        result['right'] = rr
+        sizes['width'] = dist
+
+    epair = _outermost_pair(end_faces, bd)
+    if epair:
+        (rs, re), _ = epair
+        result['start'] = rs
+        result['end'] = re
+
+    return result, sizes
+
+
+def _outermost_pair(faces, axis):
+    """Pick the outermost opposing pair along 'axis'. Returns
+    ((neg_side_ref, pos_side_ref), distance) or None."""
+    if len(faces) < 2:
+        return None
+    best = None
+    best_dist = 0.0
+    for i in range(len(faces)):
+        for j in range(i + 1, len(faces)):
+            ri, ni, oi = faces[i]
+            rj, nj, oj = faces[j]
+            if ni.DotProduct(nj) > -0.5:      # must oppose
+                continue
+            diff = XYZ(oj.X - oi.X, oj.Y - oi.Y, 0)
+            dist = abs(diff.DotProduct(ni))
+            if dist > best_dist:
+                best_dist = dist
+                best = (i, j)
+    if not best:
+        return None
+    i, j = best
+    ri, ni, oi = faces[i]
+    rj, nj, oj = faces[j]
+    if ni.DotProduct(axis) < 0:
+        return (ri, rj), best_dist
+    return (rj, ri), best_dist
+
+
+# =====================================================================
+#  GRIDS
+# =====================================================================
+
+def get_grid_reference(grid):
+    try:
+        return Reference(grid)
+    except:
+        return None
+
+
+def signed_dist_to_grid(point, grid):
+    curve = grid.Curve
+    start = curve.GetEndPoint(0)
+    gd = curve.Direction.Normalize()
+    perp = XYZ(-gd.Y, gd.X, 0)
+    vec = XYZ(point.X - start.X, point.Y - start.Y, 0)
+    return vec.DotProduct(perp)
+
+
+def find_beam_grids(geom, view):
+    """Grids split relative to the beam axis: parallel (measured across, along
+    bp) and perpendicular (measured along the beam, along bd)."""
+    bd = geom['bd']
+    par, perp = [], []
+    for g in FilteredElementCollector(doc, view.Id).OfClass(Grid).ToElements():
+        try:
+            curve = g.Curve
+            if not isinstance(curve, Line):
+                continue
+            gd = curve.Direction.Normalize()
+            dot = abs(gd.X * bd.X + gd.Y * bd.Y)
+            sd = signed_dist_to_grid(geom['mid'], g)
+            if dot > 0.9:
+                par.append((g, sd, abs(sd)))
+            elif dot < 0.1:
+                perp.append(g)
+        except:
+            continue
+    par.sort(key=lambda x: x[2])
+    return par, perp
+
+
+# =====================================================================
+#  DIMENSION CREATION
+# =====================================================================
+
+def make_dim(view, line, ref_array, dim_type_id=None):
+    if dim_type_id:
+        dt = doc.GetElement(dim_type_id)
+        if dt:
+            return doc.Create.NewDimension(view, line, ref_array, dt)
+    return doc.Create.NewDimension(view, line, ref_array)
+
+
+def _line(base, direction, half):
+    p1 = XYZ(base.X - direction.X * half, base.Y - direction.Y * half, base.Z)
+    p2 = XYZ(base.X + direction.X * half, base.Y + direction.Y * half, base.Z)
+    return Line.CreateBound(p1, p2)
+
+
+def create_dim_width(beam, view, refs, geom, sizes, off, dt_id):
+    created, errs = [], []
+    if 'left' not in refs or 'right' not in refs:
+        return created, errs
+    bp = geom['bp']
+    width = sizes.get('width', 0.0)
+    half = (width / 2.0 if width > 0 else 1.0) + off
+    base = geom['mid']
+    ra = ReferenceArray()
+    ra.Append(refs['left'])
+    ra.Append(refs['right'])
+    try:
+        d = make_dim(view, _line(base, bp, half), ra, dt_id)
+        if d:
+            created.append(d.Id)
+    except Exception as ex:
+        errs.append("Width: {}".format(str(ex)))
+    return created, errs
+
+
+def _dim_to_parallel(beam, view, ref, geom, off_along, off_extra, dt_id, tag):
+    """Dim a beam reference (centre or a side face) to the nearest parallel
+    grid, measured across the beam (along bp)."""
+    created, errs = [], []
+    bd, bp, mid = geom['bd'], geom['bp'], geom['mid']
+    par, _ = find_beam_grids(view=view, geom=geom)
+    if not par:
+        return created, ["no parallel grid"]
+    g, sd, ad = par[0]
+    if ad < 0.05:
+        return created, []
+    gr = get_grid_reference(g)
+    if not gr:
+        return created, ["no grid ref"]
+    ra = ReferenceArray()
+    ra.Append(ref)
+    ra.Append(gr)
+    # Line along bp, centred between beam and grid, shifted along the beam so
+    # the different dimensions don't stack on top of each other.
+    cen = XYZ(mid.X + bp.X * (sd / 2.0) + bd.X * off_extra,
+              mid.Y + bp.Y * (sd / 2.0) + bd.Y * off_extra, mid.Z)
+    half = ad / 2.0 + off + 1.0
+    try:
+        d = make_dim(view, _line(cen, bp, half), ra, dt_id)
+        if d:
+            created.append(d.Id)
+    except Exception as ex:
+        errs.append("{}: {}".format(tag, str(ex)))
+    return created, errs
+
+
+def create_dim_center_to_grid(beam, view, refs, geom, off, dt_id):
+    if 'center' not in refs:
+        return [], ["no centre ref"]
+    return _dim_to_parallel(beam, view, refs['center'], geom,
+                            0.0, off * 2.0, dt_id, "CtrGrid")
+
+
+def create_dim_face_to_grid(beam, view, refs, geom, off, dt_id):
+    par, _ = find_beam_grids(view=view, geom=geom)
+    if not par:
+        return [], ["no parallel grid"]
+    g, sd, ad = par[0]
+    # side face nearest the grid: +bp side if grid is on +bp side
+    face_key = 'right' if sd > 0 else 'left'
+    if face_key not in refs:
+        face_key = 'left' if face_key == 'right' else 'right'
+    if face_key not in refs:
+        return [], ["no side face ref"]
+    return _dim_to_parallel(beam, view, refs[face_key], geom,
+                            0.0, off * 3.5, dt_id, "FaceGrid")
+
+
+def create_dim_end_to_grid(beam, view, refs, geom, off, dt_id):
+    created, errs = [], []
+    bd, bp = geom['bd'], geom['bp']
+    _, perp = find_beam_grids(view=view, geom=geom)
+    if not perp:
+        return created, ["no perpendicular grid"]
+    for key, endpt in (('start', geom['p0']), ('end', geom['p1'])):
+        if key not in refs:
+            continue
+        best, best_d = None, 1e18
+        for g in perp:
+            d = abs(signed_dist_to_grid(endpt, g))
+            if d < best_d:
+                best_d = d
+                best = g
+        if best is None or best_d < 0.05:
+            continue
+        gr = get_grid_reference(best)
+        if not gr:
+            continue
+        ra = ReferenceArray()
+        ra.Append(refs[key])
+        ra.Append(gr)
+        base = XYZ(endpt.X + bp.X * off, endpt.Y + bp.Y * off, endpt.Z)
+        half = best_d + 2.0
+        try:
+            d = make_dim(view, _line(base, bd, half), ra, dt_id)
+            if d:
+                created.append(d.Id)
+        except Exception as ex:
+            errs.append("End {}: {}".format(key, str(ex)))
+    return created, errs
+
+
+# =====================================================================
+#  WPF DIALOG
+# =====================================================================
+
+class AutoDimBeamDialog(Window):
+    def __init__(self, count, dim_types):
+        self.count = count
+        self.dim_types = dim_types
+        self.result = None
+        self._build()
+
+    def _st(self, t):
+        b = TextBlock(); b.Text = t; b.FontSize = 12
+        b.FontWeight = FontWeights.SemiBold; b.Foreground = B(DQT_ACCENT)
+        b.Margin = Thickness(0, 0, 0, 6); return b
+
+    def _cb(self, t, c=True):
+        x = CheckBox(); x.Content = t
+        x.IsChecked = System.Nullable[System.Boolean](c)
+        x.Margin = Thickness(4, 3, 0, 3); x.FontSize = 11.5
+        x.Foreground = B(DQT_TEXT_DARK); return x
+
+    def _nt(self, t):
+        b = TextBlock(); b.Text = t; b.FontSize = 10
+        b.Foreground = B(Color.FromRgb(0x99, 0x99, 0x99))
+        b.TextWrapping = TextWrapping.Wrap
+        b.Margin = Thickness(24, 0, 0, 2); return b
+
+    def _cd(self, ch):
+        b = Border(); b.Background = B(DQT_WHITE)
+        b.BorderBrush = B(DQT_BORDER); b.BorderThickness = Thickness(1)
+        b.CornerRadius = CornerRadius(4)
+        b.Margin = Thickness(16, 10, 16, 0)
+        b.Padding = Thickness(12, 10, 12, 10)
+        p = StackPanel()
+        for c in ch:
+            p.Children.Add(c)
+        b.Child = p; return b
+
+    def _build(self):
+        self.Title = "Auto Dimension Beams - DQT"
+        self.Width = 440; self.SizeToContent = SizeToContent.Height
+        self.WindowStartupLocation = WindowStartupLocation.CenterScreen
+        self.ResizeMode = ResizeMode.NoResize; self.Background = B(DQT_BG)
+
+        m = StackPanel()
+
+        hd = Border(); hd.Background = B(DQT_DARK)
+        hd.Padding = Thickness(16, 12, 16, 12)
+        hp = StackPanel()
+        t = TextBlock(); t.Text = "Auto Dimension Beams"
+        t.FontSize = 16; t.FontWeight = FontWeights.Bold
+        t.Foreground = B(DQT_PRIMARY); t.FontFamily = FontFamily("Segoe UI")
+        hp.Children.Add(t)
+        s = TextBlock(); s.Text = "Dang Quoc Truong (DQT)"
+        s.FontSize = 10; s.Foreground = B(DQT_ACCENT)
+        s.Margin = Thickness(0, 2, 0, 0); hp.Children.Add(s)
+        hd.Child = hp; m.Children.Add(hd)
+
+        sb = Border(); sb.Background = B(DQT_WHITE)
+        sb.BorderBrush = B(DQT_BORDER); sb.BorderThickness = Thickness(1)
+        sb.CornerRadius = CornerRadius(4)
+        sb.Margin = Thickness(16, 12, 16, 0)
+        sb.Padding = Thickness(12, 8, 12, 8)
+        st2 = TextBlock()
+        st2.Text = "{} beam(s) selected".format(self.count)
+        st2.FontSize = 13; st2.FontWeight = FontWeights.SemiBold
+        st2.Foreground = B(DQT_TEXT_DARK); sb.Child = st2
+        m.Children.Add(sb)
+
+        dt_label = self._st("Dimension Type")
+        self.cmb_dim_type = ComboBox()
+        self.cmb_dim_type.FontSize = 11.5
+        self.cmb_dim_type.Height = 28
+        default_item = ComboBoxItem()
+        default_item.Content = "<Default>"
+        default_item.Tag = None
+        self.cmb_dim_type.Items.Add(default_item)
+        self.cmb_dim_type.SelectedIndex = 0
+        for name, eid in self.dim_types:
+            item = ComboBoxItem()
+            item.Content = name
+            item.Tag = eid
+            self.cmb_dim_type.Items.Add(item)
+        m.Children.Add(self._cd([dt_label, self.cmb_dim_type]))
+
+        self.chk_w = self._cb("Beam width (side to side)", True)
+        m.Children.Add(self._cd([self._st("1. Beam Size"), self.chk_w]))
+
+        self.chk_f = self._cb("Side face to nearest parallel grid", False)
+        m.Children.Add(self._cd([self._st("2. Face to Grid"),
+            self.chk_f, self._nt("Beam side face to the grid running along it")]))
+
+        self.chk_c = self._cb("Centreline to nearest parallel grid", False)
+        m.Children.Add(self._cd([self._st("3. Center to Grid"),
+            self.chk_c, self._nt("Beam centreline to the grid running along it")]))
+
+        self.chk_e = self._cb("Each end to nearest perpendicular grid", False)
+        m.Children.Add(self._cd([self._st("4. End to Grid"),
+            self.chk_e, self._nt("Beam ends to the grids crossing it")]))
+
+        op = StackPanel(); op.Orientation = Orientation.Horizontal
+        ol = TextBlock(); ol.Text = "Dim line offset (mm): "
+        ol.FontSize = 12; ol.Foreground = B(DQT_TEXT_DARK)
+        ol.VerticalAlignment = VerticalAlignment.Center; op.Children.Add(ol)
+        self.txt_off = TextBox(); self.txt_off.Text = "500"
+        self.txt_off.Width = 80; self.txt_off.FontSize = 12
+        self.txt_off.Padding = Thickness(4, 2, 4, 2); op.Children.Add(self.txt_off)
+        m.Children.Add(self._cd([op]))
+
+        bp = StackPanel(); bp.Orientation = Orientation.Horizontal
+        bp.HorizontalAlignment = HorizontalAlignment.Right
+        bp.Margin = Thickness(16, 14, 16, 14)
+        bc = Button(); bc.Content = "Cancel"; bc.Width = 90; bc.Height = 32
+        bc.FontSize = 12; bc.Margin = Thickness(0, 0, 8, 0)
+        bc.Background = B(DQT_WHITE); bc.Foreground = B(DQT_TEXT_DARK)
+        bc.Click += self._cancel; bp.Children.Add(bc)
+        br = Button(); br.Content = "Create Dimensions"
+        br.Width = 140; br.Height = 32; br.FontSize = 12
+        br.FontWeight = FontWeights.SemiBold
+        br.Background = B(DQT_ACCENT); br.Foreground = B(DQT_WHITE)
+        br.Click += self._run; bp.Children.Add(br)
+        m.Children.Add(bp)
+
+        f = Border(); f.Background = B(DQT_DARK)
+        f.Padding = Thickness(16, 6, 16, 6)
+        ft = TextBlock()
+        ft.Text = "Copyright (c) 2025 Dang Quoc Truong (DQT)"
+        ft.FontSize = 9; ft.Foreground = B(DQT_ACCENT)
+        ft.HorizontalAlignment = HorizontalAlignment.Center
+        f.Child = ft; m.Children.Add(f)
+        self.Content = m
+
+    def _cancel(self, s, e):
+        self.result = None; self.Close()
+
+    def _run(self, s, e):
+        try:
+            off = float(self.txt_off.Text)
+        except:
+            off = 500.0
+        dim_type_id = None
+        sel_item = self.cmb_dim_type.SelectedItem
+        if sel_item and sel_item.Tag is not None:
+            dim_type_id = sel_item.Tag
+        self.result = {
+            'w': self.chk_w.IsChecked == True,
+            'f': self.chk_f.IsChecked == True,
+            'c': self.chk_c.IsChecked == True,
+            'e': self.chk_e.IsChecked == True,
+            'off': off,
+            'dim_type_id': dim_type_id,
+        }
+        self.Close()
+
+
+# =====================================================================
+#  MAIN
+# =====================================================================
+
+def main():
+    view = active_view
+    if view.ViewType not in [
+        DB.ViewType.FloorPlan, DB.ViewType.CeilingPlan,
+        DB.ViewType.EngineeringPlan, DB.ViewType.AreaPlan
+    ]:
+        forms.alert("Plan views only.", title="Auto Dimension Beams - DQT")
+        return
+
+    beams = []
+    sel = uidoc.Selection.GetElementIds()
+    if sel.Count > 0:
+        for eid in sel:
+            e = doc.GetElement(eid)
+            if is_beam(e):
+                beams.append(e)
+    if not beams:
+        try:
+            picks = uidoc.Selection.PickObjects(
+                ObjectType.Element, BeamSelectionFilter(),
+                "Select beams to dimension")
+            for p in picks:
+                e = doc.GetElement(p.ElementId)
+                if e:
+                    beams.append(e)
+        except:
+            return
+    if not beams:
+        forms.alert("No beams selected.", title="Auto Dimension Beams - DQT")
+        return
+
+    dim_types = get_all_dimension_types()
+    dlg = AutoDimBeamDialog(len(beams), dim_types)
+    dlg.ShowDialog()
+    if dlg.result is None:
+        return
+
+    r = dlg.result
+    if not any([r['w'], r['f'], r['c'], r['e']]):
+        forms.alert("Select at least one option.",
+                    title="Auto Dimension Beams - DQT")
+        return
+
+    dt_id = r['dim_type_id']
+    off = r['off'] / MM
+    total = 0
+    failed = []
+    errors = []
+
+    txn = Transaction(doc, "DQT - Auto Dimension Beams")
+    txn.Start()
+    try:
+        for beam in beams:
+            bid = _eid_int(beam.Id)
+            cd = 0
+            try:
+                geom = get_beam_geom(beam)
+                if geom is None:
+                    errors.append("Beam {}: not a straight beam".format(bid))
+                    failed.append(bid)
+                    continue
+                refs, sizes = get_beam_refs(beam, view, geom)
+                if r['w']:
+                    dims, es = create_dim_width(
+                        beam, view, refs, geom, sizes, off, dt_id)
+                    cd += len(dims)
+                    errors.extend(["Beam {} {}".format(bid, x) for x in es])
+                if r['f']:
+                    dims, es = create_dim_face_to_grid(
+                        beam, view, refs, geom, off, dt_id)
+                    cd += len(dims)
+                    errors.extend(["Beam {} {}".format(bid, x) for x in es])
+                if r['c']:
+                    dims, es = create_dim_center_to_grid(
+                        beam, view, refs, geom, off, dt_id)
+                    cd += len(dims)
+                    errors.extend(["Beam {} {}".format(bid, x) for x in es])
+                if r['e']:
+                    dims, es = create_dim_end_to_grid(
+                        beam, view, refs, geom, off, dt_id)
+                    cd += len(dims)
+                    errors.extend(["Beam {} {}".format(bid, x) for x in es])
+                total += cd
+                if cd == 0:
+                    errors.append("Beam {}: refs={}, dims=0".format(
+                        bid, list(refs.keys())))
+                    failed.append(bid)
+            except Exception as ex:
+                errors.append("Beam {} error: {}".format(bid, str(ex)))
+                failed.append(bid)
+        txn.Commit()
+    except Exception as ex:
+        txn.RollBack()
+        forms.alert("Transaction failed: {}".format(str(ex)),
+                    title="Auto Dimension Beams - DQT")
+        return
+
+    ok = len(beams) - len(failed)
+    msg = "Created {} dimension(s) for {} of {} beam(s).".format(
+        total, ok, len(beams))
+    if failed:
+        msg += "\n\n{} failed (ID: {})".format(
+            len(failed), ", ".join(str(x) for x in failed[:10]))
+    if errors:
+        msg += "\n\nDetails:\n" + "\n".join(errors[:5])
+    forms.alert(msg, title="Auto Dimension Beams - DQT")
+
+
+if __name__ == '__main__':
+    main()
+else:
+    main()
