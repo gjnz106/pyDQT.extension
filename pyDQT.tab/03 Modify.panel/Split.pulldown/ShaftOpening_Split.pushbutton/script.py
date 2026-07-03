@@ -9,6 +9,10 @@ per element (Document.Create.NewOpening takes a single CurveArray), so holes
 inside a boundary cannot be preserved on the new openings - they are dropped
 with a warning if found.
 
+User-drawn "Symbolic Line" marks inside the original sketch (extra lines added
+with the Symbolic Line tool while editing the shaft's boundary) ARE captured
+and restored on the matching new opening.
+
 Dang Quoc Truong - DQT (c) 2026
 """
 
@@ -68,6 +72,115 @@ def get_curve_loops_from_opening(opening):
                 curve_loops.append(curve_loop)
 
     return curve_loops
+
+
+def get_symbolic_lines(elem):
+    """User-drawn 'Symbolic Line' curves inside the element's sketch (extra
+    marks drawn with the Symbolic Line tool while editing the shaft's
+    boundary). These are NOT part of Sketch.Profile (which only holds the
+    closed boundary loops), so they are read separately here and must be
+    explicitly recreated on the split pieces or they are lost when the
+    original opening is deleted."""
+    lines = []
+    try:
+        cat_filter = ElementCategoryFilter(DB.BuiltInCategory.OST_SymbolicLines)
+        dep_ids = elem.GetDependentElements(cat_filter)
+    except:
+        return lines
+    for did in dep_ids:
+        e = doc.GetElement(did)
+        try:
+            curve = e.GeometryCurve
+        except:
+            curve = None
+        if curve is None:
+            continue
+        style_id = None
+        try:
+            style_id = e.LineStyle.Id
+        except:
+            pass
+        lines.append((curve, style_id))
+    return lines
+
+
+def point_in_loop(point, loop):
+    """Even-odd ray-cast point-in-polygon test against a curve loop (same
+    method as check_if_loop_is_inside, but against a raw point)."""
+    ray_end = XYZ(point.X + 10000, point.Y, point.Z)
+    ray = Line.CreateBound(point, ray_end)
+    intersection_count = 0
+    for curve in loop:
+        try:
+            result = curve.Intersect(ray)
+            if result == DB.SetComparisonResult.Overlap:
+                intersection_count += 1
+        except:
+            pass
+    return intersection_count % 2 == 1
+
+
+def symbolic_lines_for_loop(symbolic_lines, loop):
+    """Which of the captured symbolic lines belong inside this boundary loop
+    (tested by the line's midpoint) - so each split piece only gets back the
+    marks that were drawn inside its own footprint."""
+    result = []
+    for curve, style_id in symbolic_lines:
+        try:
+            mid = curve.Evaluate(0.5, True)
+        except:
+            mid = curve.GetEndPoint(0)
+        if point_in_loop(mid, loop):
+            result.append((curve, style_id))
+    return result
+
+
+def _make_sketch_plane_at(curve):
+    try:
+        p0 = curve.GetEndPoint(0)
+        plane = Plane.CreateByNormalAndOrigin(XYZ.BasisZ, XYZ(0, 0, p0.Z))
+        return SketchPlane.Create(doc, plane)
+    except:
+        return None
+
+
+def recreate_symbolic_lines(symbolic_lines):
+    """Best-effort: recreate each captured symbolic line. Tries
+    Document.Create.NewSymbolicCurve first (the exact match for the original
+    element type, but its availability/signature isn't confirmed against a
+    live Revit API); falls back to a plain Model Line at the same location so
+    the mark is visually restored either way. Returns (created, dropped)."""
+    created = 0
+    dropped = 0
+    for curve, style_id in symbolic_lines:
+        sketch_plane = _make_sketch_plane_at(curve)
+        if sketch_plane is None:
+            dropped += 1
+            continue
+        c = curve.Clone()
+        new_elem = None
+        for args in ((c, sketch_plane), (sketch_plane, c)):
+            try:
+                new_elem = doc.Create.NewSymbolicCurve(*args)
+                if new_elem is not None:
+                    break
+            except:
+                new_elem = None
+        if new_elem is None:
+            try:
+                new_elem = doc.Create.NewModelCurve(c, sketch_plane)
+            except:
+                new_elem = None
+        if new_elem is None:
+            dropped += 1
+            continue
+        if style_id is not None:
+            try:
+                new_elem.LineStyle = doc.GetElement(style_id)
+            except:
+                pass
+        created += 1
+    return created, dropped
 
 
 def check_if_loop_is_inside(inner_loop, outer_loop):
@@ -192,7 +305,11 @@ def split_shaft(opening):
         print("  Shaft opening has only one boundary - skipping")
         return None
 
+    all_symbolic_lines = get_symbolic_lines(opening)
     print("\nFound {} curve loops in shaft opening".format(len(curve_loops)))
+    if all_symbolic_lines:
+        print("Found {} symbolic line(s) drawn in the sketch".format(
+            len(all_symbolic_lines)))
 
     loop_data = []
     for i, loop in enumerate(curve_loops):
@@ -271,6 +388,8 @@ def split_shaft(opening):
     try:
         new_openings = []
         dropped_holes_total = 0
+        symbolic_created_total = 0
+        symbolic_dropped_total = 0
 
         for idx, data in enumerate(main_boundaries):
             print("\nCreating shaft opening {} (area: {:.2f}, {} curves, "
@@ -283,6 +402,15 @@ def split_shaft(opening):
                     base_level, top_level, data['loop'])
                 copy_shaft_params(opening, new_opening, top_connected)
                 new_openings.append(new_opening)
+
+                my_symbolic = symbolic_lines_for_loop(
+                    all_symbolic_lines, data['loop'])
+                if my_symbolic:
+                    s_created, s_dropped = recreate_symbolic_lines(my_symbolic)
+                    symbolic_created_total += s_created
+                    symbolic_dropped_total += s_dropped
+                    print("  Restored {} symbolic line(s), {} dropped".format(
+                        s_created, s_dropped))
             except Exception as e:
                 print("  WARNING: Failed to create shaft opening {}: {}".format(
                     idx + 1, str(e)))
@@ -291,7 +419,8 @@ def split_shaft(opening):
 
         t.Commit()
 
-        return new_openings, dropped_holes_total
+        return (new_openings, dropped_holes_total,
+                symbolic_created_total, symbolic_dropped_total)
 
     except Exception as e:
         t.RollBack()
@@ -347,6 +476,8 @@ def main():
 
         total_created = 0
         total_dropped_holes = 0
+        total_symbolic_created = 0
+        total_symbolic_dropped = 0
         successful_splits = 0
         failed_splits = 0
 
@@ -359,9 +490,11 @@ def main():
             try:
                 result = split_shaft(opening)
                 if result:
-                    new_openings, dropped_holes = result
+                    new_openings, dropped_holes, sym_created, sym_dropped = result
                     total_created += len(new_openings)
                     total_dropped_holes += dropped_holes
+                    total_symbolic_created += sym_created
+                    total_symbolic_dropped += sym_dropped
                     successful_splits += 1
                     print("SUCCESS: Created {} shaft openings from this split".format(
                         len(new_openings)))
@@ -378,6 +511,8 @@ def main():
         print("Failed splits: {}".format(failed_splits))
         print("Total new shaft openings created: {}".format(total_created))
         print("Total holes dropped: {}".format(total_dropped_holes))
+        print("Symbolic lines restored: {}".format(total_symbolic_created))
+        print("Symbolic lines dropped: {}".format(total_symbolic_dropped))
         print("=" * 60)
 
         summary_message = (
@@ -387,10 +522,16 @@ def main():
             "Failed: {}\n"
             "Total new shaft openings created: {}"
         ).format(len(selected_openings), successful_splits, failed_splits, total_created)
+        if total_symbolic_created:
+            summary_message += "\n\nRestored {} symbolic line(s) drawn in the original " \
+                "sketch(es).".format(total_symbolic_created)
         if total_dropped_holes:
             summary_message += "\n\n{} hole(s) could not be preserved (shaft openings " \
                 "support only one boundary each) and were dropped.".format(
                     total_dropped_holes)
+        if total_symbolic_dropped:
+            summary_message += "\n\n{} symbolic line(s) could not be restored.".format(
+                total_symbolic_dropped)
 
         forms.alert(summary_message, title="Split Shaft Opening Summary")
 
