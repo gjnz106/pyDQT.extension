@@ -22,6 +22,7 @@ __author__ = "DQT"
 from Autodesk.Revit.DB import *
 from Autodesk.Revit.UI.Selection import ObjectType
 from pyrevit import revit, DB, UI, forms
+from System.Collections.Generic import List
 import math
 import clr
 clr.AddReference('System.Core')
@@ -98,7 +99,8 @@ def get_symbolic_lines(elem, curve_loops):
     line to preserve. Boundary edges are excluded because their midpoints lie
     ON a loop, not inside it. Wrapped so it can never raise - a detection
     failure must not abort the split itself."""
-    found = {}   # id(int) -> (curve, style_id)
+    found = {}   # id(int) -> (element_id, curve, style_id)
+    cats_seen = set()
 
     def _collect(e):
         if e is None:
@@ -122,7 +124,13 @@ def get_symbolic_lines(elem, curve_loops):
             style_id = e.LineStyle.Id
         except:
             pass
-        found[key] = (curve, style_id)
+        try:
+            cats_seen.add("{} / {}".format(
+                type(e).__name__,
+                e.Category.Name if e.Category else "?"))
+        except:
+            pass
+        found[key] = (e.Id, curve, style_id)
 
     # Hosts to walk: the opening plus its sketch(es).
     hosts = [("Opening", elem)]
@@ -167,7 +175,35 @@ def get_symbolic_lines(elem, curve_loops):
                     cls_name, len(coll), len(found) - before))
 
     print("  Total lines to preserve: {}".format(len(found)))
+    if cats_seen:
+        print("  Line kinds: {}".format(", ".join(sorted(cats_seen))))
     return list(found.values())
+
+
+def preserve_lines_in_place(items):
+    """Keep the ORIGINAL line elements (same category/kind as the shaft's own
+    lines) by copying them in place before the original opening is deleted -
+    instead of drawing new 2D model lines. Falls back to recreating them as
+    model lines only if the in-place copy is rejected. Returns (kept, dropped).
+    """
+    if not items:
+        return 0, 0
+    ids = List[ElementId]()
+    for eid, curve, style_id in items:
+        ids.Add(eid)
+    try:
+        copies = ElementTransformUtils.CopyElements(doc, ids, XYZ(0, 0, 0))
+        n = copies.Count if copies is not None else 0
+        if n > 0:
+            print("  Copied {} original line element(s) in place "
+                  "(same kind as the shaft's lines)".format(n))
+            return n, 0
+        print("  In-place copy returned nothing - falling back to model lines")
+    except Exception as ex:
+        print("  In-place copy failed ({}) - falling back to model lines".format(ex))
+    created, dropped = recreate_symbolic_lines(
+        [(curve, style_id) for (eid, curve, style_id) in items])
+    return created, dropped
 
 
 def point_in_loop(point, loop):
@@ -184,21 +220,6 @@ def point_in_loop(point, loop):
         except:
             pass
     return intersection_count % 2 == 1
-
-
-def symbolic_lines_for_loop(symbolic_lines, loop):
-    """Which of the captured symbolic lines belong inside this boundary loop
-    (tested by the line's midpoint) - so each split piece only gets back the
-    marks that were drawn inside its own footprint."""
-    result = []
-    for curve, style_id in symbolic_lines:
-        try:
-            mid = curve.Evaluate(0.5, True)
-        except:
-            mid = curve.GetEndPoint(0)
-        if point_in_loop(mid, loop):
-            result.append((curve, style_id))
-    return result
 
 
 def _make_sketch_plane_at(curve):
@@ -459,8 +480,6 @@ def split_shaft(opening):
     try:
         new_openings = []
         dropped_holes_total = 0
-        symbolic_created_total = 0
-        symbolic_dropped_total = 0
 
         for idx, data in enumerate(main_boundaries):
             print("\nCreating shaft opening {} (area: {:.2f}, {} curves, "
@@ -473,18 +492,14 @@ def split_shaft(opening):
                     base_level, top_level, data['loop'])
                 copy_shaft_params(opening, new_opening, top_connected)
                 new_openings.append(new_opening)
-
-                my_symbolic = symbolic_lines_for_loop(
-                    all_symbolic_lines, data['loop'])
-                if my_symbolic:
-                    s_created, s_dropped = recreate_symbolic_lines(my_symbolic)
-                    symbolic_created_total += s_created
-                    symbolic_dropped_total += s_dropped
-                    print("  Restored {} symbolic line(s), {} dropped".format(
-                        s_created, s_dropped))
             except Exception as e:
                 print("  WARNING: Failed to create shaft opening {}: {}".format(
                     idx + 1, str(e)))
+
+        # Preserve the original lines (as their own kind, not new 2D lines) by
+        # copying them in place, BEFORE the original opening is deleted.
+        symbolic_created_total, symbolic_dropped_total = preserve_lines_in_place(
+            all_symbolic_lines)
 
         doc.Delete(opening.Id)
 
