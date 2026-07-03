@@ -120,25 +120,43 @@ def get_opening_levels(opening):
     return base_level, top_level, top_connected
 
 
+def _copy_named_double(src, dst, name):
+    try:
+        sp = src.LookupParameter(name)
+        dp = dst.LookupParameter(name)
+        if sp and dp and not dp.IsReadOnly:
+            dp.Set(sp.AsDouble())
+    except:
+        pass
+
+
 def copy_shaft_params(src, dst, top_connected):
     """Best-effort copy of the offset/height parameters (by display name -
     the exact BuiltInParameter enum for shaft openings isn't confirmed, so
-    LookupParameter by the UI name is used instead)."""
-    for name in ("Base Offset", "Top Offset", "Unconnected Height"):
-        try:
-            sp = src.LookupParameter(name)
-            dp = dst.LookupParameter(name)
-            if sp and dp and not dp.IsReadOnly:
-                dp.Set(sp.AsDouble())
-        except:
-            pass
-    if not top_connected:
-        try:
-            dp_top = dst.LookupParameter("Top Constraint")
-            if dp_top and not dp_top.IsReadOnly:
-                dp_top.Set(ElementId.InvalidElementId)
-        except:
-            pass
+    LookupParameter by the UI name is used instead).
+
+    Base Offset always applies. For Top: if the original was connected to a
+    level, only Top Offset needs copying (NewOpening already set Top
+    Constraint to the right level). If the original was UNCONNECTED, Top
+    Constraint must be set to InvalidElementId FIRST - Unconnected Height stays
+    read-only/inapplicable while Top Constraint still points at a level, so
+    setting it beforehand silently does nothing and the new opening ends up
+    with the wrong (near-zero) vertical extent, which is why Revit stops
+    drawing the shaft's symbolic (not-cut-by-view) cross line."""
+    _copy_named_double(src, dst, "Base Offset")
+
+    if top_connected:
+        _copy_named_double(src, dst, "Top Offset")
+        return
+
+    try:
+        dp_top = dst.LookupParameter("Top Constraint")
+        if dp_top and not dp_top.IsReadOnly:
+            dp_top.Set(ElementId.InvalidElementId)
+    except:
+        pass
+    doc.Regenerate()   # let "Unconnected Height" become editable
+    _copy_named_double(src, dst, "Unconnected Height")
 
 
 def create_opening_from_curve_loop(base_level, top_level, curve_loop):
