@@ -74,34 +74,95 @@ def get_curve_loops_from_opening(opening):
     return curve_loops
 
 
-def get_symbolic_lines(elem):
-    """User-drawn 'Symbolic Line' curves inside the element's sketch (extra
-    marks drawn with the Symbolic Line tool while editing the shaft's
-    boundary). These are NOT part of Sketch.Profile (which only holds the
-    closed boundary loops), so they are read separately here and must be
-    explicitly recreated on the split pieces or they are lost when the
-    original opening is deleted."""
-    lines = []
-    try:
-        cat_filter = ElementCategoryFilter(DB.BuiltInCategory.OST_SymbolicLines)
-        dep_ids = elem.GetDependentElements(cat_filter)
-    except:
-        return lines
-    for did in dep_ids:
-        e = doc.GetElement(did)
+def get_symbolic_lines(elem, curve_loops):
+    """User-drawn extra lines inside the element's sketch (e.g. a Symbolic
+    Line drawn while editing the shaft's boundary). These are NOT part of
+    Sketch.Profile (which only holds the closed boundary loops), so they have
+    to be located separately or they are lost when the original opening is
+    deleted.
+
+    It isn't confirmed which element actually "owns" these lines for
+    GetDependentElements purposes (the Opening itself, or its Sketch), nor
+    whether Revit files them under OST_SymbolicLines or the generic OST_Lines
+    category - so every combination is tried, unioned, and the counts of each
+    are printed to the pyRevit output so a failure can be diagnosed from the
+    log. If GetDependentElements finds nothing at all, falls back to a global,
+    category-based search matched purely by geometry (does the line's midpoint
+    fall inside one of this opening's own boundary loops) - this doesn't
+    depend on any dependency-tracking assumption at all."""
+    found = {}   # id(int) -> (curve, style_id)
+
+    def _collect_curve(e):
         try:
             curve = e.GeometryCurve
         except:
-            curve = None
+            return
         if curve is None:
-            continue
+            return
+        key = _eid_int(e.Id)
+        if key in found:
+            return
         style_id = None
         try:
             style_id = e.LineStyle.Id
         except:
             pass
-        lines.append((curve, style_id))
-    return lines
+        found[key] = (curve, style_id)
+
+    hosts = [("Opening", elem)]
+    try:
+        sketch_filter = DB.ElementClassFilter(DB.Sketch)
+        for did in elem.GetDependentElements(sketch_filter):
+            sk = doc.GetElement(did)
+            if isinstance(sk, DB.Sketch):
+                hosts.append(("Sketch", sk))
+    except:
+        pass
+
+    cats = (DB.BuiltInCategory.OST_SymbolicLines, DB.BuiltInCategory.OST_Lines)
+    for host_name, host in hosts:
+        for cat in cats:
+            before = len(found)
+            try:
+                cat_filter = ElementCategoryFilter(cat)
+                for did in host.GetDependentElements(cat_filter):
+                    _collect_curve(doc.GetElement(did))
+            except Exception as ex:
+                print("  GetDependentElements({}, {}) failed: {}".format(
+                    host_name, cat, ex))
+                continue
+            print("  GetDependentElements({}, {}) -> {} new line(s)".format(
+                host_name, cat, len(found) - before))
+
+    if not found:
+        print("  Nothing found via GetDependentElements - trying a global "
+              "category search matched by geometry...")
+        for cat in cats:
+            try:
+                coll = list(FilteredElementCollector(doc).OfCategory(cat)
+                            .WhereElementIsNotElementType())
+            except Exception as ex:
+                print("  Global collector for {} failed: {}".format(cat, ex))
+                continue
+            matched = 0
+            for e in coll:
+                try:
+                    curve = e.GeometryCurve
+                except:
+                    continue
+                if curve is None:
+                    continue
+                try:
+                    mid = curve.Evaluate(0.5, True)
+                except:
+                    mid = curve.GetEndPoint(0)
+                if any(point_in_loop(mid, loop) for loop in curve_loops):
+                    _collect_curve(e)
+                    matched += 1
+            print("  Global {}: {} total in document, {} inside this "
+                  "shaft's boundary".format(cat, len(coll), matched))
+
+    return list(found.values())
 
 
 def point_in_loop(point, loop):
@@ -305,7 +366,7 @@ def split_shaft(opening):
         print("  Shaft opening has only one boundary - skipping")
         return None
 
-    all_symbolic_lines = get_symbolic_lines(opening)
+    all_symbolic_lines = get_symbolic_lines(opening, curve_loops)
     print("\nFound {} curve loops in shaft opening".format(len(curve_loops)))
     if all_symbolic_lines:
         print("Found {} symbolic line(s) drawn in the sketch".format(
