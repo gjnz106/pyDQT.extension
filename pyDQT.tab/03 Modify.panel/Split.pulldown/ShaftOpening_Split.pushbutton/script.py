@@ -180,29 +180,86 @@ def get_symbolic_lines(elem, curve_loops):
     return list(found.values())
 
 
-def preserve_lines_in_place(items):
-    """Keep the ORIGINAL line elements (same category/kind as the shaft's own
-    lines) by copying them in place before the original opening is deleted -
-    instead of drawing new 2D model lines. Falls back to recreating them as
-    model lines only if the in-place copy is rejected. Returns (kept, dropped).
-    """
-    if not items:
-        return 0, 0
-    ids = List[ElementId]()
-    for eid, curve, style_id in items:
-        ids.Add(eid)
+class _SwallowFailures(IFailuresPreprocessor):
+    def PreprocessFailures(self, fa):
+        return FailureProcessingResult.Continue
+
+
+def get_element_sketch(elem):
     try:
-        copies = ElementTransformUtils.CopyElements(doc, ids, XYZ(0, 0, 0))
-        n = copies.Count if copies is not None else 0
-        if n > 0:
-            print("  Copied {} original line element(s) in place "
-                  "(same kind as the shaft's lines)".format(n))
-            return n, 0
-        print("  In-place copy returned nothing - falling back to model lines")
+        for did in elem.GetDependentElements(ElementClassFilter(Sketch)):
+            s = doc.GetElement(did)
+            if isinstance(s, Sketch):
+                return s
+    except:
+        pass
+    return None
+
+
+def add_lines_to_opening_sketch(opening, curves):
+    """Add the captured curves back INTO the new opening's own sketch (via
+    SketchEditScope) so they are real sketch members - the same kind
+    (ModelLine / <Sketch>) as the originals - rather than free 2D model lines.
+    Must run OUTSIDE any open transaction (SketchEditScope manages its own).
+    Returns (added, dropped)."""
+    if not curves:
+        return 0, 0
+    sketch = get_element_sketch(opening)
+    if sketch is None:
+        print("  No sketch on new opening - cannot restore sketch lines")
+        return 0, len(curves)
+
+    scope = SketchEditScope(doc, "DQT - Restore shaft sketch lines")
+    try:
+        scope.Start(sketch.Id)
     except Exception as ex:
-        print("  In-place copy failed ({}) - falling back to model lines".format(ex))
-    created, dropped = recreate_symbolic_lines(
-        [(curve, style_id) for (eid, curve, style_id) in items])
+        print("  SketchEditScope.Start failed: {}".format(ex))
+        return 0, len(curves)
+
+    added = 0
+    dropped = 0
+    try:
+        sp = sketch.SketchPlane
+        plane_z = sp.GetPlane().Origin.Z
+        t = Transaction(doc, "DQT - Add sketch lines")
+        t.Start()
+        for curve in curves:
+            try:
+                dz = plane_z - curve.GetEndPoint(0).Z
+                c = curve
+                if abs(dz) > 1e-9:
+                    c = curve.CreateTransformed(
+                        Transform.CreateTranslation(XYZ(0, 0, dz)))
+                doc.Create.NewModelCurve(c, sp)
+                added += 1
+            except Exception:
+                dropped += 1
+        t.Commit()
+        scope.Commit(_SwallowFailures())
+    except Exception as ex:
+        print("  Sketch edit failed ({}) - lines not restored".format(ex))
+        try:
+            scope.Cancel()
+        except:
+            pass
+        return 0, len(curves)
+    return added, dropped
+
+
+def recreate_as_model_lines(curves):
+    """Last-resort fallback: draw the curves as free-standing model lines (2D
+    look, not embedded in the sketch). Returns (created, dropped)."""
+    created = 0
+    dropped = 0
+    for curve in curves:
+        try:
+            plane = Plane.CreateByNormalAndOrigin(
+                XYZ.BasisZ, XYZ(0, 0, curve.GetEndPoint(0).Z))
+            sp = SketchPlane.Create(doc, plane)
+            doc.Create.NewModelCurve(curve.Clone(), sp)
+            created += 1
+        except:
+            dropped += 1
     return created, dropped
 
 
@@ -220,54 +277,6 @@ def point_in_loop(point, loop):
         except:
             pass
     return intersection_count % 2 == 1
-
-
-def _make_sketch_plane_at(curve):
-    try:
-        p0 = curve.GetEndPoint(0)
-        plane = Plane.CreateByNormalAndOrigin(XYZ.BasisZ, XYZ(0, 0, p0.Z))
-        return SketchPlane.Create(doc, plane)
-    except:
-        return None
-
-
-def recreate_symbolic_lines(symbolic_lines):
-    """Best-effort: recreate each captured symbolic line. Tries
-    Document.Create.NewSymbolicCurve first (the exact match for the original
-    element type, but its availability/signature isn't confirmed against a
-    live Revit API); falls back to a plain Model Line at the same location so
-    the mark is visually restored either way. Returns (created, dropped)."""
-    created = 0
-    dropped = 0
-    for curve, style_id in symbolic_lines:
-        sketch_plane = _make_sketch_plane_at(curve)
-        if sketch_plane is None:
-            dropped += 1
-            continue
-        c = curve.Clone()
-        new_elem = None
-        for args in ((c, sketch_plane), (sketch_plane, c)):
-            try:
-                new_elem = doc.Create.NewSymbolicCurve(*args)
-                if new_elem is not None:
-                    break
-            except:
-                new_elem = None
-        if new_elem is None:
-            try:
-                new_elem = doc.Create.NewModelCurve(c, sketch_plane)
-            except:
-                new_elem = None
-        if new_elem is None:
-            dropped += 1
-            continue
-        if style_id is not None:
-            try:
-                new_elem.LineStyle = doc.GetElement(style_id)
-            except:
-                pass
-        created += 1
-    return created, dropped
 
 
 def check_if_loop_is_inside(inner_loop, outer_loop):
@@ -473,14 +482,20 @@ def split_shaft(opening):
 
     print("\nCreating {} separate shaft openings".format(len(main_boundaries)))
 
+    # PHASE 1 - create the new openings and delete the original inside one
+    # transaction. Symbolic-line restoration cannot happen here: it needs a
+    # SketchEditScope, which must run with NO transaction open. So we only
+    # remember each (new opening, its boundary loop) pair and defer the line
+    # work to phase 2 after this transaction has committed.
+    new_openings = []
+    opening_loop_pairs = []
+    dropped_holes_total = 0
+
     t = Transaction(doc, "DQT - Split Shaft {} into {} Openings".format(
         _eid_int(opening.Id), len(main_boundaries)))
     t.Start()
 
     try:
-        new_openings = []
-        dropped_holes_total = 0
-
         for idx, data in enumerate(main_boundaries):
             print("\nCreating shaft opening {} (area: {:.2f}, {} curves, "
                   "{} hole(s) dropped)".format(
@@ -492,21 +507,14 @@ def split_shaft(opening):
                     base_level, top_level, data['loop'])
                 copy_shaft_params(opening, new_opening, top_connected)
                 new_openings.append(new_opening)
+                opening_loop_pairs.append((new_opening, data['loop']))
             except Exception as e:
                 print("  WARNING: Failed to create shaft opening {}: {}".format(
                     idx + 1, str(e)))
 
-        # Preserve the original lines (as their own kind, not new 2D lines) by
-        # copying them in place, BEFORE the original opening is deleted.
-        symbolic_created_total, symbolic_dropped_total = preserve_lines_in_place(
-            all_symbolic_lines)
-
         doc.Delete(opening.Id)
 
         t.Commit()
-
-        return (new_openings, dropped_holes_total,
-                symbolic_created_total, symbolic_dropped_total)
 
     except Exception as e:
         t.RollBack()
@@ -514,6 +522,37 @@ def split_shaft(opening):
         print("\n=== ERROR IN SPLIT_SHAFT ===")
         print(traceback.format_exc())
         raise e
+
+    # PHASE 2 - restore the captured lines into each new opening's own sketch.
+    # The Curve geometry captured in all_symbolic_lines stays valid even after
+    # the source opening is deleted (they are geometry objects, not live
+    # elements). Each captured curve is assigned to whichever new boundary loop
+    # its midpoint falls inside, then added as a real sketch member.
+    symbolic_created_total = 0
+    symbolic_dropped_total = 0
+    if all_symbolic_lines:
+        line_curves = [c for (_eid, c, _sid) in all_symbolic_lines]
+        for new_opening, loop in opening_loop_pairs:
+            curves_here = []
+            for c in line_curves:
+                mid = _curve_midpoint(c)
+                if mid is not None and point_in_loop(mid, loop):
+                    curves_here.append(c)
+            if not curves_here:
+                continue
+            print("\nRestoring {} sketch line(s) into opening {}".format(
+                len(curves_here), _eid_int(new_opening.Id)))
+            added, dropped = add_lines_to_opening_sketch(new_opening, curves_here)
+            if added == 0 and dropped:
+                # SketchEditScope path failed - fall back to plain model lines
+                # so the marks are at least visually restored.
+                print("  Sketch-member restore failed - drawing model lines")
+                added, dropped = recreate_as_model_lines(curves_here)
+            symbolic_created_total += added
+            symbolic_dropped_total += dropped
+
+    return (new_openings, dropped_holes_total,
+            symbolic_created_total, symbolic_dropped_total)
 
 
 def main():
