@@ -173,35 +173,107 @@ def organize_loops_with_holes(curve_loops):
     return result
 
 
-def get_floor_point_modifications(floor):
-    """Get all point modifications (vertex elevations) from a floor"""
-    modifications = []
-    
+def _get_slab_shape_editor(floor):
+    """Floor.SlabShapeEditor was a property up to Revit 2023; from 2024 it is
+    the method GetSlabShapeEditor(). Try the method first, fall back to the
+    property so the tool works across versions."""
     try:
-        # Get the floor's SlabShapeEditor
-        slab_shape_editor = floor.SlabShapeEditor
-        if slab_shape_editor:
-            # Get all vertices
-            vertices = slab_shape_editor.SlabShapeVertices
-            
-            for vertex in vertices:
-                # Get vertex position
-                position = vertex.Position
-                modifications.append({
-                    'position': position,
-                    'x': position.X,
-                    'y': position.Y,
-                    'z': position.Z
-                })
-            
-            print("  Found {} point modifications".format(len(modifications)))
+        sse = floor.GetSlabShapeEditor()
+        if sse is not None:
+            return sse
+    except:
+        pass
+    try:
+        return floor.SlabShapeEditor
+    except:
+        return None
+
+
+def get_floor_point_modifications(floor, base_z):
+    """Vertex height edits from 'Modify Sub Elements' (sloped/stepped slabs).
+
+    Returns a list of {x, y, dz} where dz is the vertex height RELATIVE to the
+    floor's flat base plane (base_z). A flat, un-edited floor has an editor
+    that is not enabled -> returns an empty list (nothing to restore)."""
+    modifications = []
+    try:
+        sse = _get_slab_shape_editor(floor)
+        if sse is None:
+            return modifications
+
+        try:
+            enabled = sse.IsEnabled
+        except:
+            enabled = True
+        if not enabled:
+            # Flat floor - no vertex modifications to carry over.
+            return modifications
+
+        for vertex in sse.SlabShapeVertices:
+            position = vertex.Position
+            modifications.append({
+                'x': position.X,
+                'y': position.Y,
+                'dz': position.Z - base_z,
+            })
+
+        moved = sum(1 for m in modifications if abs(m['dz']) > 1e-6)
+        print("  Found {} slab-shape vertices ({} raised/lowered)".format(
+            len(modifications), moved))
     except Exception as e:
-        print("  No point modifications found or error: {}".format(str(e)))
-    
+        print("  Could not read point modifications: {}".format(str(e)))
+
     return modifications
 
 
-def create_floor_from_curves(floor_type, level, outer_loop, holes=None):
+def restore_point_modifications(new_floor, modifications):
+    """Best-effort re-apply of the captured vertex height edits onto a new
+    floor. Each captured vertex is matched to the new floor's nearest vertex by
+    XY, then raised/lowered by its dz. Fully guarded: any failure is swallowed
+    so it can NEVER roll back the split - a flat result is acceptable, a lost
+    floor is not."""
+    if not modifications:
+        return 0
+    try:
+        sse = _get_slab_shape_editor(new_floor)
+        if sse is None:
+            return 0
+        try:
+            if not sse.IsEnabled:
+                sse.Enable()
+        except:
+            pass
+
+        verts = list(sse.SlabShapeVertices)
+        if not verts:
+            return 0
+
+        applied = 0
+        for m in modifications:
+            if abs(m['dz']) < 1e-6:
+                continue
+            best = None
+            best_d = 1e-3   # ~0.3 mm XY match tolerance
+            for v in verts:
+                p = v.Position
+                d = ((p.X - m['x']) ** 2 + (p.Y - m['y']) ** 2) ** 0.5
+                if d < best_d:
+                    best_d = d
+                    best = v
+            if best is not None:
+                try:
+                    sse.ModifySubElement(best, m['dz'])
+                    applied += 1
+                except Exception as e:
+                    print("    vertex restore failed: {}".format(e))
+        return applied
+    except Exception as e:
+        print("  Point-modification restore skipped: {}".format(e))
+        return 0
+
+
+def create_floor_from_curves(floor_type, level, outer_loop, holes=None,
+                             height_offset=None):
     """Create a new floor from curve loops (without point modifications)"""
     
     # Get names safely
@@ -238,7 +310,21 @@ def create_floor_from_curves(floor_type, level, outer_loop, holes=None):
     # Create floor with all loops at once
     new_floor = DB.Floor.Create(doc, curve_loops, floor_type.Id, level.Id)
     print("  Floor created successfully: {}".format(_eid_int(new_floor.Id)))
-    
+
+    # Floor.Create ignores the original elevation: the new floor lands at the
+    # level with Height Offset From Level = 0. Restore the original offset so
+    # the split floors keep their exact elevation instead of jumping.
+    if height_offset is not None:
+        try:
+            p = new_floor.get_Parameter(
+                DB.BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM)
+            if p and not p.IsReadOnly:
+                p.Set(height_offset)
+                print("  Height Offset From Level restored: {:.4f} ft".format(
+                    height_offset))
+        except Exception as e:
+            print("  WARNING: could not restore height offset: {}".format(e))
+
     return new_floor
 
 
@@ -249,38 +335,55 @@ def split_floor(floor):
     floor_type = doc.GetElement(floor_type_id)
     level_id = floor.LevelId
     level = doc.GetElement(level_id)
-    
-    # Get point modifications from original floor
+
+    # Original vertical position, so the split floors keep their elevation:
+    #   - height_offset : the "Height Offset From Level" parameter
+    #   - base_z        : absolute Z of the floor's flat base plane (taken from
+    #                     the sketch boundary itself, which is the most reliable
+    #                     source of the true elevation)
+    height_offset = None
+    try:
+        p = floor.get_Parameter(DB.BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM)
+        if p:
+            height_offset = p.AsDouble()
+            print("\nOriginal Height Offset From Level: {:.4f} ft".format(height_offset))
+    except Exception as e:
+        print("\nCould not read Height Offset From Level: {}".format(e))
+
+    # Get all curve loops
+    curve_loops = get_curve_loops_from_floor(floor)
+
+    if len(curve_loops) <= 1:
+        print("  Floor has only one boundary - skipping")
+        return None
+
+    base_z = 0.0
+    try:
+        for c in curve_loops[0]:
+            base_z = c.GetEndPoint(0).Z
+            break
+    except:
+        pass
+
+    # Get point modifications (sloped/stepped vertices) relative to base plane
     print("\nExtracting point modifications from original floor...")
-    point_modifications = get_floor_point_modifications(floor)
-    
-    # Warn user if there are point modifications
-    if point_modifications and len(point_modifications) > 0:
-        print("\nWARNING: Floor has {} point modifications (vertex height adjustments)".format(
-            len(point_modifications)))
-        
+    point_modifications = get_floor_point_modifications(floor, base_z)
+
+    if point_modifications and any(abs(m['dz']) > 1e-6 for m in point_modifications):
         result = forms.alert(
-            "This floor has {} modified vertices (height adjustments).\n\n".format(len(point_modifications)) +
-            "NOTE: These vertex modifications CANNOT be automatically transferred to the split floors.\n\n" +
-            "After splitting:\n" +
-            "- The new floors will be created with FLAT surfaces\n" +
-            "- You will need to manually re-apply vertex modifications using 'Modify Sub Elements'\n\n" +
+            "This floor has modified vertices (height adjustments / sloped slab).\n\n"
+            "The tool will TRY to re-apply them to the split floors by matching\n"
+            "vertices, but the result may be imperfect - please verify the\n"
+            "elevations afterwards.\n\n"
             "Do you want to continue with the split?",
             title="Point Modifications Warning",
             ok=True,
             cancel=True
         )
-        
+
         if not result:
             print("  User cancelled due to point modifications")
             return None
-    
-    # Get all curve loops
-    curve_loops = get_curve_loops_from_floor(floor)
-    
-    if len(curve_loops) <= 1:
-        print("  Floor has only one boundary - skipping")
-        return None
     
     print("\nFound {} curve loops in floor".format(len(curve_loops)))
     
@@ -393,12 +496,20 @@ def split_floor(floor):
                 idx + 1, data['area'], data['curve_count'], len(data['holes'])))
             try:
                 new_floor = create_floor_from_curves(
-                    floor_type, 
-                    level, 
-                    data['loop'], 
-                    data['holes'] if len(data['holes']) > 0 else None
+                    floor_type,
+                    level,
+                    data['loop'],
+                    data['holes'] if len(data['holes']) > 0 else None,
+                    height_offset
                 )
                 new_floors.append(new_floor)
+
+                # Re-apply the sloped-vertex edits (best-effort, never fatal).
+                if point_modifications:
+                    doc.Regenerate()
+                    applied = restore_point_modifications(new_floor, point_modifications)
+                    if applied:
+                        print("  Re-applied {} vertex height edit(s)".format(applied))
             except Exception as e:
                 print("  WARNING: Failed to create floor {}: {}".format(idx + 1, str(e)))
                 # Continue with other floors
