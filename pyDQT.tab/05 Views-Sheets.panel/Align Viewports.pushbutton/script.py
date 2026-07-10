@@ -254,8 +254,8 @@ def copy_label_offset(main_vp, other_vp):
     leaves other_vp's title where it was; the Revit-side reason is
     returned so it can be surfaced instead of a generic warning."""
     try:
-        offset = main_vp.GetLabelOffset()
-        other_vp.SetLabelOffset(offset)
+        offset = main_vp.LabelOffset
+        other_vp.LabelOffset = offset
         return True, None
     except Exception as ex:
         return False, str(ex)
