@@ -340,20 +340,36 @@ def align_viewport(main_view, main_vp, other_view, other_vp, method, grid_pt):
         return False, str(ex)
 
 
-def copy_label_offset(main_vp, other_vp):
-    """Best-effort copy of the View Title's offset from main_vp to other_vp,
-    so the title/name text lines up the same way as the crop region.
+def _title_anchor(viewport):
+    """Bottom-center of the viewport's box outline (sheet space) - the point
+    a LabelOffset of (0,0,0) hangs the title from by default."""
+    outline = viewport.GetBoxOutline()
+    smin, smax = outline.MinimumPoint, outline.MaximumPoint
+    return XYZ((smin.X + smax.X) / 2.0, smin.Y, 0)
 
-    LabelOffset is relative to the viewport's OWN crop box, and Revit
-    rejects an offset that would place the title too far outside that
-    box's valid range. So a straight copy can fail when the two viewports
-    don't share the same crop size (which is why this pairs well with
-    'Apply same Crop / Scope Box'). Never raises - a failed copy just
-    leaves other_vp's title where it was; the Revit-side reason is
-    returned so it can be surfaced instead of a generic warning."""
+
+def copy_label_offset(main_vp, other_vp):
+    """Best-effort alignment of the View Title's ABSOLUTE sheet position to
+    match main_vp's, not a raw copy of the offset value.
+
+    LabelOffset is relative to each viewport's OWN default title anchor
+    (bottom-center of its box outline), so a straight copy places the title
+    at the wrong spot whenever the two viewports' crops differ in size -
+    the same class of problem as crop-box-center viewport alignment. This
+    compensates for that: other_vp's new offset = main_vp's offset, shifted
+    by the difference between the two viewports' anchors, so the title
+    lands at the same sheet position Main's title is at. Never raises - a
+    failed copy just leaves other_vp's title where it was; the Revit-side
+    reason is returned so it can be surfaced instead of a generic warning."""
     try:
-        offset = main_vp.LabelOffset
-        other_vp.LabelOffset = offset
+        main_offset = main_vp.LabelOffset
+        main_anchor = _title_anchor(main_vp)
+        other_anchor = _title_anchor(other_vp)
+        new_offset = XYZ(
+            main_offset.X + (main_anchor.X - other_anchor.X),
+            main_offset.Y + (main_anchor.Y - other_anchor.Y),
+            0)
+        other_vp.LabelOffset = new_offset
         return True, None
     except Exception as ex:
         return False, str(ex)
@@ -635,9 +651,19 @@ def main():
 
     sheet_map = {"{} - {}".format(s.SheetNumber, s.Name): s for s in sheets}
 
+    all_grids = [g for g in FilteredElementCollector(doc)
+                .OfClass(Grid).WhereElementIsNotElementType() if g.Name]
+    # Multiple independent grid systems (e.g. separate blocks/towers) can
+    # legally reuse the same names ("A", "1", ...) - disambiguate with the
+    # ElementId whenever a name isn't unique, so the picker never shows
+    # indistinguishable duplicate entries.
+    name_counts = {}
+    for g in all_grids:
+        name_counts[g.Name] = name_counts.get(g.Name, 0) + 1
     grid_items = sorted(
-        [(g.Name, g.Id) for g in FilteredElementCollector(doc)
-         .OfClass(Grid).WhereElementIsNotElementType() if g.Name],
+        [(g.Name if name_counts[g.Name] == 1
+          else "{} (ID {})".format(g.Name, _eid_int(g.Id)), g.Id)
+         for g in all_grids],
         key=lambda x: x[0])
 
     dlg = AlignViewportsDialog(sorted(sheet_map.keys()), grid_items)
