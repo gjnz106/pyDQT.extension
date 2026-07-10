@@ -28,6 +28,9 @@ Differences from a typical "align viewports" tool:
   - A sheet that fails (e.g. a view type mismatch) is skipped with a
     warning; it does not abort the rest of the run. Everything still runs
     inside one TransactionGroup, so the whole operation is a single Undo.
+  - Optionally aligns the View Title too (Viewport.LabelOffset), so the
+    view name/number text lines up the same way the viewports do - not
+    just the crop region.
 
 Copyright (c) 2026 Dang Quoc Truong (DQT)
 All rights reserved.
@@ -239,6 +242,18 @@ def copy_crop_scope(main_view, other_view):
             pass
 
 
+def copy_label_offset(main_vp, other_vp):
+    """Best-effort copy of the View Title's offset from main_vp to other_vp,
+    so the title/name text lines up the same way as the crop region.
+    Never raises - a failed copy just leaves other_vp's title where it was."""
+    try:
+        offset = main_vp.GetLabelOffset()
+        other_vp.SetLabelOffset(offset)
+        return True
+    except Exception:
+        return False
+
+
 def get_titleblock(sheet):
     """The sheet's single title block, or None if there isn't exactly one."""
     tbs = list(FilteredElementCollector(doc, sheet.Id)
@@ -365,6 +380,7 @@ class AlignViewportsDialog(Window):
         self.chk_overlap = self._cb(
             "Overlap same-type viewports (match by view name)", False)
         self.chk_crop = self._cb("Apply same Crop / Scope Box", False)
+        self.chk_title = self._cb("Align View Titles (label position)", False)
         self.chk_legend = self._cb("Include Legends", False)
         self.chk_tb_type = self._cb("Match TitleBlock Type", False)
         self.chk_tb_zero = self._cb("Snap TitleBlocks to origin (0,0,0)", True)
@@ -373,7 +389,8 @@ class AlignViewportsDialog(Window):
             self.chk_overlap,
             self._nt("Needed when a sheet has more than one viewport of the "
                      "same view type."),
-            self.chk_crop, self.chk_legend, self.chk_tb_type, self.chk_tb_zero]))
+            self.chk_crop, self.chk_title, self.chk_legend, self.chk_tb_type,
+            self.chk_tb_zero]))
 
         # Buttons
         bp = StackPanel(); bp.Orientation = Orientation.Horizontal
@@ -417,6 +434,7 @@ class AlignViewportsDialog(Window):
             'main': main_key,
             'overlap': self.chk_overlap.IsChecked == True,
             'crop': self.chk_crop.IsChecked == True,
+            'title': self.chk_title.IsChecked == True,
             'legend': self.chk_legend.IsChecked == True,
             'tb_type': self.chk_tb_type.IsChecked == True,
             'tb_zero': self.chk_tb_zero.IsChecked == True,
@@ -454,6 +472,7 @@ def main():
 
     warnings = []
     aligned_count = 0
+    titles_aligned = 0
     processed_sheets = 0
     error_sheets = []
 
@@ -506,6 +525,15 @@ def main():
                     except Exception:
                         warnings.append("Sheet {}: could not align '{}'".format(
                             other_sheet.SheetNumber, other_view.Name))
+                        continue
+
+                    if opts['title']:
+                        if copy_label_offset(main_vp, other_vp):
+                            titles_aligned += 1
+                        else:
+                            warnings.append(
+                                "Sheet {}: could not align title of '{}'".format(
+                                    other_sheet.SheetNumber, other_view.Name))
 
                 for vid in other_view_ids:
                     unhide_view(doc.GetElement(vid))
@@ -543,6 +571,8 @@ def main():
     print("=" * 60)
     print("Sheets processed: {}/{}".format(processed_sheets, len(other_sheets)))
     print("Viewports aligned: {}".format(aligned_count))
+    if opts['title']:
+        print("View titles aligned: {}".format(titles_aligned))
     if error_sheets:
         print("Sheets with errors: {}".format(len(error_sheets)))
         for num, err in error_sheets:
@@ -559,6 +589,8 @@ def main():
         "Sheets processed: {}/{}\n"
         "Viewports aligned: {}"
     ).format(opts['main'], processed_sheets, len(other_sheets), aligned_count)
+    if opts['title']:
+        summary += "\nView titles aligned: {}".format(titles_aligned)
     if error_sheets:
         summary += "\n\n{} sheet(s) failed - see the pyRevit output for details."\
             .format(len(error_sheets))
