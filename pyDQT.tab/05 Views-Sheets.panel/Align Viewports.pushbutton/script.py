@@ -245,13 +245,20 @@ def copy_crop_scope(main_view, other_view):
 def copy_label_offset(main_vp, other_vp):
     """Best-effort copy of the View Title's offset from main_vp to other_vp,
     so the title/name text lines up the same way as the crop region.
-    Never raises - a failed copy just leaves other_vp's title where it was."""
+
+    LabelOffset is relative to the viewport's OWN crop box, and Revit
+    rejects an offset that would place the title too far outside that
+    box's valid range. So a straight copy can fail when the two viewports
+    don't share the same crop size (which is why this pairs well with
+    'Apply same Crop / Scope Box'). Never raises - a failed copy just
+    leaves other_vp's title where it was; the Revit-side reason is
+    returned so it can be surfaced instead of a generic warning."""
     try:
         offset = main_vp.GetLabelOffset()
         other_vp.SetLabelOffset(offset)
-        return True
-    except Exception:
-        return False
+        return True, None
+    except Exception as ex:
+        return False, str(ex)
 
 
 def get_titleblock(sheet):
@@ -389,8 +396,11 @@ class AlignViewportsDialog(Window):
             self.chk_overlap,
             self._nt("Needed when a sheet has more than one viewport of the "
                      "same view type."),
-            self.chk_crop, self.chk_title, self.chk_legend, self.chk_tb_type,
-            self.chk_tb_zero]))
+            self.chk_crop, self.chk_title,
+            self._nt("Works best together with 'Apply same Crop / Scope Box' "
+                     "- Revit rejects a title position that lands outside a "
+                     "differently-sized crop box."),
+            self.chk_legend, self.chk_tb_type, self.chk_tb_zero]))
 
         # Buttons
         bp = StackPanel(); bp.Orientation = Orientation.Horizontal
@@ -528,12 +538,16 @@ def main():
                         continue
 
                     if opts['title']:
-                        if copy_label_offset(main_vp, other_vp):
+                        ok, reason = copy_label_offset(main_vp, other_vp)
+                        if ok:
                             titles_aligned += 1
                         else:
                             warnings.append(
-                                "Sheet {}: could not align title of '{}'".format(
-                                    other_sheet.SheetNumber, other_view.Name))
+                                "Sheet {}: could not align title of '{}' "
+                                "(often fixed by also enabling 'Apply same "
+                                "Crop / Scope Box') - {}".format(
+                                    other_sheet.SheetNumber, other_view.Name,
+                                    reason))
 
                 for vid in other_view_ids:
                     unhide_view(doc.GetElement(vid))
