@@ -287,28 +287,35 @@ def grid_intersection_point(grid1, grid2):
 
 
 def world_point_to_sheet(view, viewport, world_pt):
-    """Map a world-space point to sheet-space coordinates through viewport,
-    using the point's fractional position within the view's own crop box.
-    Works even when two views have differently-sized crops, as long as the
-    point lies within both. Assumes the view is not rotated on the sheet
-    (the common case). Returns XYZ (sheet space, Z=0), or None if it can't
-    be computed (no crop box, degenerate crop, etc.)."""
+    """Map a world-space point to sheet-space coordinates through viewport.
+
+    Scale-based, NOT fractional-outline-based: the earlier version mapped
+    via Viewport.GetBoxOutline(), but that outline INCLUDES the view title
+    that hangs below the crop region, so the box it spans is bigger than
+    (and vertically offset from) the actual crop rectangle - which threw
+    the mapped point off. Instead:
+      - the crop region's center in model space maps to GetBoxCenter()
+        (the crop rectangle's center on the sheet, title excluded);
+      - the point's in-plane offset from that center is measured along the
+        view's own axes and divided by the view scale to get the sheet-space
+        offset (model_ft / scale = sheet_ft).
+    Assumes the viewport is not rotated on the sheet (the common case).
+    Returns XYZ (sheet space, Z=0), or None if it can't be computed."""
     try:
         crop = view.CropBox
-        if crop is None:
+        scale = view.Scale
+        if crop is None or not scale or scale <= 0:
             return None
-        local_pt = crop.Transform.Inverse.OfPoint(world_pt)
-        dx = crop.Max.X - crop.Min.X
-        dy = crop.Max.Y - crop.Min.Y
-        if abs(dx) < 1e-9 or abs(dy) < 1e-9:
-            return None
-        fx = (local_pt.X - crop.Min.X) / dx
-        fy = (local_pt.Y - crop.Min.Y) / dy
-
-        outline = viewport.GetBoxOutline()
-        smin, smax = outline.MinimumPoint, outline.MaximumPoint
-        return XYZ(smin.X + fx * (smax.X - smin.X),
-                  smin.Y + fy * (smax.Y - smin.Y), 0)
+        tf = crop.Transform
+        center_local = XYZ((crop.Min.X + crop.Max.X) / 2.0,
+                          (crop.Min.Y + crop.Max.Y) / 2.0,
+                          (crop.Min.Z + crop.Max.Z) / 2.0)
+        center_world = tf.OfPoint(center_local)
+        v = world_pt - center_world
+        dx = v.DotProduct(tf.BasisX)
+        dy = v.DotProduct(tf.BasisY)
+        sc = viewport.GetBoxCenter()
+        return XYZ(sc.X + dx / scale, sc.Y + dy / scale, 0)
     except Exception:
         return None
 
@@ -340,35 +347,48 @@ def align_viewport(main_view, main_vp, other_view, other_vp, method, grid_pt):
         return False, str(ex)
 
 
-def _title_anchor(viewport):
-    """Bottom-center of the viewport's box outline (sheet space) - the point
-    a LabelOffset of (0,0,0) hangs the title from by default."""
-    outline = viewport.GetBoxOutline()
-    smin, smax = outline.MinimumPoint, outline.MaximumPoint
-    return XYZ((smin.X + smax.X) / 2.0, smin.Y, 0)
+def _crop_bottom_left_on_sheet(view, viewport):
+    """Bottom-left corner of the crop RECTANGLE on the sheet (title excluded),
+    computed from GetBoxCenter() plus the crop's half-size divided by the view
+    scale. Returns XYZ, or None. Uses the crop rectangle - not GetBoxOutline -
+    so the view title hanging below doesn't distort it."""
+    try:
+        crop = view.CropBox
+        scale = view.Scale
+        if crop is None or not scale or scale <= 0:
+            return None
+        hw = (crop.Max.X - crop.Min.X) / 2.0 / scale
+        hh = (crop.Max.Y - crop.Min.Y) / 2.0 / scale
+        c = viewport.GetBoxCenter()
+        return XYZ(c.X - hw, c.Y - hh, 0)
+    except Exception:
+        return None
 
 
-def copy_label_offset(main_vp, other_vp):
+def copy_label_offset(main_view, main_vp, other_view, other_vp):
     """Best-effort alignment of the View Title's ABSOLUTE sheet position to
     match main_vp's, not a raw copy of the offset value.
 
-    LabelOffset is relative to each viewport's OWN default title anchor
-    (bottom-center of its box outline), so a straight copy places the title
-    at the wrong spot whenever the two viewports' crops differ in size -
-    the same class of problem as crop-box-center viewport alignment. This
-    compensates for that: other_vp's new offset = main_vp's offset, shifted
-    by the difference between the two viewports' anchors, so the title
-    lands at the same sheet position Main's title is at. Never raises - a
-    failed copy just leaves other_vp's title where it was; the Revit-side
-    reason is returned so it can be surfaced instead of a generic warning."""
+    LabelOffset is relative to each viewport's OWN crop rectangle, so a
+    straight copy places the title at the wrong spot whenever the two
+    viewports' crops differ in size - the same class of problem as
+    crop-box-center viewport alignment. This compensates for it: other_vp's
+    new offset = main_vp's offset, shifted by the difference between the two
+    viewports' crop-rectangle reference corners (computed from the crop
+    rectangle on the sheet, title excluded), so the title lands at the same
+    sheet position Main's title is at. Falls back to a raw offset copy if the
+    crop rectangle can't be computed. Never raises; returns (ok, reason)."""
     try:
         main_offset = main_vp.LabelOffset
-        main_anchor = _title_anchor(main_vp)
-        other_anchor = _title_anchor(other_vp)
-        new_offset = XYZ(
-            main_offset.X + (main_anchor.X - other_anchor.X),
-            main_offset.Y + (main_anchor.Y - other_anchor.Y),
-            0)
+        main_anchor = _crop_bottom_left_on_sheet(main_view, main_vp)
+        other_anchor = _crop_bottom_left_on_sheet(other_view, other_vp)
+        if main_anchor is not None and other_anchor is not None:
+            new_offset = XYZ(
+                main_offset.X + (main_anchor.X - other_anchor.X),
+                main_offset.Y + (main_anchor.Y - other_anchor.Y),
+                0)
+        else:
+            new_offset = main_offset
         other_vp.LabelOffset = new_offset
         return True, None
     except Exception as ex:
@@ -753,7 +773,8 @@ def main():
                         continue
 
                     if opts['title']:
-                        ok, reason = copy_label_offset(main_vp, other_vp)
+                        ok, reason = copy_label_offset(
+                            main_view, main_vp, other_view, other_vp)
                         if ok:
                             titles_aligned += 1
                         else:
