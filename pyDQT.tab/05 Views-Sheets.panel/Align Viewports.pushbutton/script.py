@@ -5,12 +5,23 @@ Aligns viewports on multiple sheets to a chosen "Main" sheet, so the same
 view lands at the exact same position on every sheet - regardless of what
 annotation/content each view happens to show.
 
-How it works: viewport alignment is done via Viewport.SetBoxCenter(), which
-positions a viewport by its crop-region outline. That outline is affected by
-whatever is currently visible in the view (tags, dimensions, etc.), so every
-view involved is temporarily hidden (elements only, not the crop region)
-before reading/writing box centers, and restored right after - this makes
-the alignment purely geometric and independent of view content.
+How it works: two alignment methods are available.
+  - Crop Box Center (default): Viewport.SetBoxCenter() positions a
+    viewport by its crop-region outline. That outline is affected by
+    whatever is currently visible in the view (tags, dimensions, etc.), so
+    every view involved is temporarily hidden (elements only, not the crop
+    region) before reading/writing box centers, and restored right after.
+    This only lines up the BUILDING/content correctly when every sheet's
+    viewport already has a matching crop size/extent - if one sheet's crop
+    includes extra context (e.g. site boundary) that another sheet's crop
+    doesn't, the crop centers will match but the content inside will not.
+  - Grid Intersection: a chosen pair of grids (which share the same
+    world X/Y on every level) is used as the alignment reference instead.
+    For each viewport, the grid intersection's position is mapped from
+    model space to sheet space using the fractional position of the point
+    within that view's own crop box, so it works correctly even when the
+    two views' crops differ in size - the content (not just the crop
+    frame) ends up aligned.
 
 Differences from a typical "align viewports" tool:
   - Works with ANY alignable view type on the sheet (plan, section,
@@ -50,19 +61,20 @@ clr.AddReference('System')
 
 from Autodesk.Revit.DB import (
     Transaction, TransactionGroup, FilteredElementCollector,
-    BuiltInCategory, BuiltInParameter, ElementId, ViewSheet, ViewType,
-    TemporaryViewMode, XYZ
+    BuiltInCategory, BuiltInParameter, ElementId, ElementTransformUtils,
+    Grid, ViewSheet, ViewType, TemporaryViewMode, XYZ
 )
 from pyrevit import forms
 
 import System
 from System.Windows import (
     Window, WindowStartupLocation, Thickness, HorizontalAlignment,
-    TextWrapping, FontWeights, CornerRadius, SizeToContent, ResizeMode
+    VerticalAlignment, TextWrapping, FontWeights, CornerRadius,
+    SizeToContent, ResizeMode
 )
 from System.Windows.Controls import (
     StackPanel, Button, TextBlock, RadioButton, Border, CheckBox,
-    Orientation, ScrollViewer
+    ComboBox, ComboBoxItem, Orientation, ScrollViewer
 )
 from System.Windows.Media import SolidColorBrush, Color, Colors, FontFamily
 
@@ -106,6 +118,14 @@ CROPPABLE_VIEW_TYPES = set([
     ViewType.FloorPlan, ViewType.CeilingPlan, ViewType.EngineeringPlan,
     ViewType.AreaPlan, ViewType.Section, ViewType.Elevation,
     ViewType.Detail, ViewType.ThreeD, ViewType.DraftingView,
+])
+
+# Views whose CropBox is a real, world-space-linked box (needed to map a
+# model point to a sheet position). Legends/Drafting views aren't tied to
+# model space this way, so grid-based alignment can't apply to them.
+GRID_ALIGNABLE_VIEW_TYPES = set([
+    ViewType.FloorPlan, ViewType.CeilingPlan, ViewType.EngineeringPlan,
+    ViewType.AreaPlan, ViewType.Section, ViewType.Elevation, ViewType.ThreeD,
 ])
 
 
@@ -242,6 +262,84 @@ def copy_crop_scope(main_view, other_view):
             pass
 
 
+def grid_intersection_point(grid1, grid2):
+    """World-space intersection of two Grid centerlines (2D, X/Y only - Z is
+    taken from grid1 since grids are vertical). Returns XYZ, or None if the
+    grids are parallel/don't intersect."""
+    try:
+        c1 = grid1.Curve
+        c2 = grid2.Curve
+        p1 = c1.GetEndPoint(0)
+        d1 = c1.GetEndPoint(1) - p1
+        p2 = c2.GetEndPoint(0)
+        d2 = c2.GetEndPoint(1) - p2
+    except Exception:
+        return None
+
+    a11, a12 = d1.X, -d2.X
+    a21, a22 = d1.Y, -d2.Y
+    b1, b2 = p2.X - p1.X, p2.Y - p1.Y
+    det = a11 * a22 - a12 * a21
+    if abs(det) < 1e-9:
+        return None
+    t = (b1 * a22 - a12 * b2) / det
+    return XYZ(p1.X + t * d1.X, p1.Y + t * d1.Y, p1.Z)
+
+
+def world_point_to_sheet(view, viewport, world_pt):
+    """Map a world-space point to sheet-space coordinates through viewport,
+    using the point's fractional position within the view's own crop box.
+    Works even when two views have differently-sized crops, as long as the
+    point lies within both. Assumes the view is not rotated on the sheet
+    (the common case). Returns XYZ (sheet space, Z=0), or None if it can't
+    be computed (no crop box, degenerate crop, etc.)."""
+    try:
+        crop = view.CropBox
+        if crop is None:
+            return None
+        local_pt = crop.Transform.Inverse.OfPoint(world_pt)
+        dx = crop.Max.X - crop.Min.X
+        dy = crop.Max.Y - crop.Min.Y
+        if abs(dx) < 1e-9 or abs(dy) < 1e-9:
+            return None
+        fx = (local_pt.X - crop.Min.X) / dx
+        fy = (local_pt.Y - crop.Min.Y) / dy
+
+        outline = viewport.GetBoxOutline()
+        smin, smax = outline.MinimumPoint, outline.MaximumPoint
+        return XYZ(smin.X + fx * (smax.X - smin.X),
+                  smin.Y + fy * (smax.Y - smin.Y), 0)
+    except Exception:
+        return None
+
+
+def align_viewport(main_view, main_vp, other_view, other_vp, method, grid_pt):
+    """Move other_vp so it aligns with main_vp. 'grid' method aligns by a
+    shared grid intersection (works even when crop sizes differ); anything
+    that can't use it (wrong view type, point not resolvable) falls back to
+    crop-box-center alignment. Returns (ok, reason-if-failed)."""
+    if method == 'grid' and grid_pt is not None \
+            and main_view.ViewType in GRID_ALIGNABLE_VIEW_TYPES \
+            and other_view.ViewType in GRID_ALIGNABLE_VIEW_TYPES:
+        main_pt = world_point_to_sheet(main_view, main_vp, grid_pt)
+        other_pt = world_point_to_sheet(other_view, other_vp, grid_pt)
+        if main_pt is not None and other_pt is not None:
+            try:
+                delta = main_pt - other_pt
+                ElementTransformUtils.MoveElement(doc, other_vp.Id, delta)
+                return True, None
+            except Exception as ex:
+                return False, str(ex)
+        # Grid point not resolvable in one of the views (e.g. it falls
+        # outside that view's crop) - fall back to crop-box-center below.
+
+    try:
+        other_vp.SetBoxCenter(main_vp.GetBoxCenter())
+        return True, None
+    except Exception as ex:
+        return False, str(ex)
+
+
 def copy_label_offset(main_vp, other_vp):
     """Best-effort copy of the View Title's offset from main_vp to other_vp,
     so the title/name text lines up the same way as the crop region.
@@ -309,8 +407,9 @@ def unhide_view(view):
 # =====================================================================
 
 class AlignViewportsDialog(Window):
-    def __init__(self, sheet_keys):
+    def __init__(self, sheet_keys, grid_items):
         self.sheet_keys = sheet_keys
+        self.grid_items = grid_items  # [(name, ElementId), ...]
         self.result = None
         self._build()
 
@@ -331,8 +430,8 @@ class AlignViewportsDialog(Window):
         b.TextWrapping = TextWrapping.Wrap
         b.Margin = Thickness(24, 0, 0, 2); return b
 
-    def _rb(self, t, checked=False):
-        r = RadioButton(); r.Content = t; r.GroupName = "MainSheet"
+    def _rb(self, t, checked=False, group="MainSheet"):
+        r = RadioButton(); r.Content = t; r.GroupName = group
         r.IsChecked = System.Nullable[System.Boolean](checked)
         r.Margin = Thickness(4, 3, 0, 3); r.FontSize = 11.5
         r.Foreground = B(DQT_TEXT_DARK); return r
@@ -383,6 +482,54 @@ class AlignViewportsDialog(Window):
             self._st("Main Sheet ({} selected)".format(len(self.sheet_keys))),
             sv]))
 
+        # Alignment method
+        self.rb_method_crop = self._rb(
+            "Crop Box Center (default)", checked=True, group="AlignMethod")
+        self.rb_method_grid = self._rb(
+            "Grid Intersection", checked=False, group="AlignMethod")
+        self.rb_method_crop.Checked += self._method_changed
+        self.rb_method_grid.Checked += self._method_changed
+
+        self.cmb_grid1 = ComboBox(); self.cmb_grid1.Width = 130
+        self.cmb_grid1.FontSize = 11.5; self.cmb_grid1.Height = 26
+        self.cmb_grid2 = ComboBox(); self.cmb_grid2.Width = 130
+        self.cmb_grid2.FontSize = 11.5; self.cmb_grid2.Height = 26
+        for combo in (self.cmb_grid1, self.cmb_grid2):
+            for name, eid in self.grid_items:
+                item = ComboBoxItem(); item.Content = name; item.Tag = eid
+                combo.Items.Add(item)
+            combo.IsEnabled = False
+        if len(self.grid_items) >= 1:
+            self.cmb_grid1.SelectedIndex = 0
+        if len(self.grid_items) >= 2:
+            self.cmb_grid2.SelectedIndex = 1
+
+        if not self.grid_items:
+            self.rb_method_grid.IsEnabled = False
+
+        g1row = StackPanel(); g1row.Orientation = Orientation.Horizontal
+        g1row.Margin = Thickness(20, 2, 0, 0)
+        g1lbl = TextBlock(); g1lbl.Text = "Grid 1: "; g1lbl.Width = 45
+        g1lbl.FontSize = 11.5; g1lbl.Foreground = B(DQT_TEXT_DARK)
+        g1lbl.VerticalAlignment = VerticalAlignment.Center
+        g1row.Children.Add(g1lbl); g1row.Children.Add(self.cmb_grid1)
+
+        g2row = StackPanel(); g2row.Orientation = Orientation.Horizontal
+        g2row.Margin = Thickness(20, 4, 0, 4)
+        g2lbl = TextBlock(); g2lbl.Text = "Grid 2: "; g2lbl.Width = 45
+        g2lbl.FontSize = 11.5; g2lbl.Foreground = B(DQT_TEXT_DARK)
+        g2lbl.VerticalAlignment = VerticalAlignment.Center
+        g2row.Children.Add(g2lbl); g2row.Children.Add(self.cmb_grid2)
+
+        m.Children.Add(self._cd([
+            self._st("Alignment Method"),
+            self.rb_method_crop, self.rb_method_grid,
+            self._nt("Use Grid Intersection when sheets' crops have "
+                     "different size/extent (e.g. one view shows extra "
+                     "site context) - Crop Box Center alone will line up "
+                     "the crop frames but not the building inside them."),
+            g1row, g2row]))
+
         # Options
         self.chk_overlap = self._cb(
             "Overlap same-type viewports (match by view name)", False)
@@ -430,6 +577,11 @@ class AlignViewportsDialog(Window):
     def _cancel(self, s, e):
         self.result = None; self.Close()
 
+    def _method_changed(self, s, e):
+        use_grid = self.rb_method_grid.IsChecked == True
+        self.cmb_grid1.IsEnabled = use_grid
+        self.cmb_grid2.IsEnabled = use_grid
+
     def _run(self, s, e):
         main_key = None
         for rb in self.radios:
@@ -440,8 +592,26 @@ class AlignViewportsDialog(Window):
             forms.alert("Select a Main sheet.", title=__title__)
             return
 
+        align_method = 'grid' if self.rb_method_grid.IsChecked == True else 'crop'
+        grid1_id = None
+        grid2_id = None
+        if align_method == 'grid':
+            i1 = self.cmb_grid1.SelectedItem
+            i2 = self.cmb_grid2.SelectedItem
+            if i1 is None or i2 is None:
+                forms.alert("Select two grids for Grid Intersection alignment.",
+                            title=__title__)
+                return
+            grid1_id, grid2_id = i1.Tag, i2.Tag
+            if _eid_int(grid1_id) == _eid_int(grid2_id):
+                forms.alert("Grid 1 and Grid 2 must be different.", title=__title__)
+                return
+
         self.result = {
             'main': main_key,
+            'align_method': align_method,
+            'grid1_id': grid1_id,
+            'grid2_id': grid2_id,
             'overlap': self.chk_overlap.IsChecked == True,
             'crop': self.chk_crop.IsChecked == True,
             'title': self.chk_title.IsChecked == True,
@@ -465,11 +635,27 @@ def main():
 
     sheet_map = {"{} - {}".format(s.SheetNumber, s.Name): s for s in sheets}
 
-    dlg = AlignViewportsDialog(sorted(sheet_map.keys()))
+    grid_items = sorted(
+        [(g.Name, g.Id) for g in FilteredElementCollector(doc)
+         .OfClass(Grid).WhereElementIsNotElementType() if g.Name],
+        key=lambda x: x[0])
+
+    dlg = AlignViewportsDialog(sorted(sheet_map.keys()), grid_items)
     dlg.ShowDialog()
     if dlg.result is None:
         return
     opts = dlg.result
+
+    grid_pt = None
+    if opts['align_method'] == 'grid':
+        g1 = doc.GetElement(opts['grid1_id'])
+        g2 = doc.GetElement(opts['grid2_id'])
+        grid_pt = grid_intersection_point(g1, g2) if (g1 and g2) else None
+        if grid_pt is None:
+            forms.alert(
+                "Could not compute an intersection for the selected grids "
+                "(they may be parallel). Pick two grids that actually "
+                "cross.", title=__title__, exitscript=True)
 
     main_sheet = sheet_map[opts['main']]
     other_sheets = [s for k, s in sheet_map.items() if k != opts['main']]
@@ -529,12 +715,15 @@ def main():
                     if opts['crop'] and main_view.ViewType in CROPPABLE_VIEW_TYPES:
                         copy_crop_scope(main_view, other_view)
 
-                    try:
-                        other_vp.SetBoxCenter(main_vp.GetBoxCenter())
+                    ok, reason = align_viewport(
+                        main_view, main_vp, other_view, other_vp,
+                        opts['align_method'], grid_pt)
+                    if ok:
                         sheet_ok += 1
-                    except Exception:
-                        warnings.append("Sheet {}: could not align '{}'".format(
-                            other_sheet.SheetNumber, other_view.Name))
+                    else:
+                        warnings.append("Sheet {}: could not align '{}' - {}"
+                                        .format(other_sheet.SheetNumber,
+                                                other_view.Name, reason))
                         continue
 
                     if opts['title']:
