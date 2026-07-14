@@ -30,8 +30,11 @@ Differences from a typical "align viewports" tool:
     matched against the Main sheet's viewports of the same type.
   - When a sheet has more than one viewport of the same view type (with
     "Overlap" enabled), viewports are paired by the underlying View's Name
-    first, falling back to order only for leftovers - safer than assuming
-    position/order alone.
+    first (covers a view reused identically across sheets), then by sheet
+    position/reading order for whatever is left (covers views that play the
+    same role on every sheet but are named per-floor, e.g. "Plan - 1st
+    Storey" vs "Plan - 2nd Storey" - the common case, where name matching
+    alone would leave everything unmatched).
   - One transaction per non-Main sheet (plus one to hide Main's views up
     front and one to restore them at the end), instead of several
     transactions per sheet - meaningfully fewer transactions on projects
@@ -173,11 +176,28 @@ def get_viewports_by_type(sheet, include_legend):
     return groups
 
 
+def _sheet_reading_order_key(vp):
+    """Sort key for a viewport's CURRENT position on its sheet: top-to-bottom,
+    then left-to-right - the standard reading order. Used to pair viewports
+    that play 'the same role' on different sheets (e.g. 'the plan on top' /
+    'the inset below') when their underlying view Names don't match, which
+    is the normal case when each floor's view is named per-floor."""
+    try:
+        c = vp.GetBoxCenter()
+        return (-c.Y, c.X)
+    except Exception:
+        return (0, 0)
+
+
 def match_viewports(main_groups, other_groups, overlap, warnings, sheet_number):
     """Pair up (main_viewport, other_viewport) for every shared view type.
     Single-vs-single pairs are matched directly. When either side has more
-    than one viewport of a type, pairing requires 'overlap' and is done by
-    the underlying View's Name first, falling back to order for leftovers."""
+    than one viewport of a type, pairing requires 'overlap' and is done in
+    two passes: first by the underlying View's Name (covers views reused
+    identically across sheets, e.g. a shared Key Plan), then - for whatever
+    is left - by matching sheet position/reading order (covers views that
+    play the same role on every sheet but are named per-floor, which is the
+    common case)."""
     pairs = []
     for vt, main_list in main_groups.items():
         other_list = other_groups.get(vt)
@@ -217,12 +237,16 @@ def match_viewports(main_groups, other_groups, overlap, warnings, sheet_number):
 
         leftover_other = [vp for vp in other_list
                           if _eid_int(vp.Id) not in used_other]
+        unmatched_main.sort(key=_sheet_reading_order_key)
+        leftover_other.sort(key=_sheet_reading_order_key)
         for m_vp, o_vp in zip(unmatched_main, leftover_other):
             pairs.append((m_vp, o_vp))
         if len(unmatched_main) != len(leftover_other):
             warnings.append(
-                "Sheet {}: could not match all {} viewports by view name"
-                .format(sheet_number, vt.ToString()))
+                "Sheet {}: {} {} viewport(s) left unmatched (count differs "
+                "from Main)".format(
+                    sheet_number, abs(len(unmatched_main) - len(leftover_other)),
+                    vt.ToString()))
 
     return pairs
 
@@ -568,7 +592,7 @@ class AlignViewportsDialog(Window):
 
         # Options
         self.chk_overlap = self._cb(
-            "Overlap same-type viewports (match by view name)", False)
+            "Overlap same-type viewports (match by name, then position)", False)
         self.chk_crop = self._cb("Apply same Crop / Scope Box", False)
         self.chk_title = self._cb("Align View Titles (label position)", False)
         self.chk_legend = self._cb("Include Legends", False)
