@@ -43,7 +43,7 @@ clr.AddReference('System')
 
 from Autodesk.Revit.DB import (
     Transaction, FilteredElementCollector, Level, ElementId, CategoryType,
-    StorageType, BuiltInParameter
+    StorageType, BuiltInParameter, ElementTransformUtils, XYZ
 )
 from pyrevit import forms, script
 
@@ -176,23 +176,26 @@ def _z_edge(bbox, kind):
     return bbox.Min.Z if kind == "base" else bbox.Max.Z
 
 
+def _elem_bbox(elem):
+    try:
+        return elem.get_BoundingBox(None)
+    except:
+        return None
+
+
 def rehost(old_level, new_level, candidates):
-    """Repoint level constraints old->new and compensate offsets so nothing
-    moves. Returns a result dict. All inside one committed transaction."""
+    """Repoint level constraints old->new and keep every element in place.
+    Returns a result dict. All inside one committed transaction."""
     tol = 0.3 / MM_PER_FT
 
     before = {}
     for elem, _assoc in candidates:
-        try:
-            bb = elem.get_BoundingBox(None)
-        except:
-            bb = None
+        bb = _elem_bbox(elem)
         if bb is not None:
             before[_eid_int(elem.Id)] = (bb.Min.Z, bb.Max.Z)
 
-    reassigned = []          # (eid, op_bip, kind)
-    level_readonly = set()   # eids whose level param could not be changed
-    rehosted = set()
+    level_readonly = set()          # could NOT change level parameter
+    assoc_by_eid = {}               # iid -> [(op_bip, kind), ...] (rehosted)
 
     t = Transaction(doc, "DQT - Rehost {} -> {}".format(
         old_level.Name, new_level.Name))
@@ -200,92 +203,115 @@ def rehost(old_level, new_level, candidates):
     try:
         # Pass 1: repoint every matching level constraint to the new level.
         for elem, assoc in candidates:
-            eid = elem.Id
+            iid = _eid_int(elem.Id)
             for (lp_bip, op_bip, kind) in assoc:
                 p = elem.get_Parameter(lp_bip)
                 if p is None:
                     continue
                 if p.IsReadOnly:
-                    level_readonly.add(_eid_int(eid))
+                    level_readonly.add(iid)
                     continue
                 try:
                     p.Set(new_level.Id)
-                    reassigned.append((eid, op_bip, kind))
-                    rehosted.add(_eid_int(eid))
+                    assoc_by_eid.setdefault(iid, []).append((op_bip, kind))
                 except:
-                    level_readonly.add(_eid_int(eid))
+                    level_readonly.add(iid)
 
         doc.Regenerate()
 
-        # Pass 2: measure the real vertical shift and subtract it back out of
-        # the matching offset parameter, so the element returns to its exact
-        # original elevation.
-        uncompensated = set()
-        for (eid, op_bip, kind) in reassigned:
-            bz = before.get(_eid_int(eid))
-            elem = doc.GetElement(eid)
-            if bz is None or elem is None:
+        # Pass 2: subtract the real vertical shift back out of each matching
+        # offset parameter, so the element returns to its exact elevation.
+        for iid, ops in assoc_by_eid.items():
+            elem = doc.GetElement(ElementId(iid))
+            bz = before.get(iid)
+            bb = _elem_bbox(elem)
+            if elem is None or bz is None or bb is None:
                 continue
-            try:
-                bb = elem.get_BoundingBox(None)
-            except:
-                bb = None
-            if bb is None:
-                continue
-            resid = _z_edge(bb, kind) - (bz[0] if kind == "base" else bz[1])
-            if abs(resid) <= tol:
-                continue
-            op = elem.get_Parameter(op_bip) if op_bip else None
-            if op is None or op.IsReadOnly:
-                uncompensated.add(_eid_int(eid))
-                continue
-            try:
-                op.Set(op.AsDouble() - resid)
-            except:
-                uncompensated.add(_eid_int(eid))
+            for (op_bip, kind) in ops:
+                resid = _z_edge(bb, kind) - (bz[0] if kind == "base" else bz[1])
+                if abs(resid) <= tol:
+                    continue
+                op = elem.get_Parameter(op_bip) if op_bip else None
+                if op is None or op.IsReadOnly:
+                    continue
+                try:
+                    op.Set(op.AsDouble() - resid)
+                except:
+                    pass
 
         doc.Regenerate()
 
-        # Pass 3: final check - anything still off its original elevation.
+        # Pass 3: rescue anything still off by physically moving it back, but
+        # ONLY when the whole element shifted uniformly (min and max moved the
+        # same amount) - that means it's safe to translate. Partial elements
+        # (base moved, top pinned to another level) are left for the offset
+        # pass and never blindly moved.
+        for iid in assoc_by_eid.keys():
+            elem = doc.GetElement(ElementId(iid))
+            bz = before.get(iid)
+            bb = _elem_bbox(elem)
+            if elem is None or bz is None or bb is None:
+                continue
+            dmin = bb.Min.Z - bz[0]
+            dmax = bb.Max.Z - bz[1]
+            if abs(dmin) <= tol and abs(dmax) <= tol:
+                continue
+            if abs(dmin - dmax) <= tol:      # uniform shift -> safe to move
+                try:
+                    ElementTransformUtils.MoveElement(
+                        doc, ElementId(iid), XYZ(0, 0, -dmin))
+                except:
+                    pass
+
+        doc.Regenerate()
+
+        # Pass 4: final verdict per element.
+        rehosted = set(assoc_by_eid.keys())
         moved = set()
-        for (eid, op_bip, kind) in reassigned:
-            bz = before.get(_eid_int(eid))
-            elem = doc.GetElement(eid)
-            if bz is None or elem is None:
+        for iid, ops in assoc_by_eid.items():
+            elem = doc.GetElement(ElementId(iid))
+            bz = before.get(iid)
+            bb = _elem_bbox(elem)
+            if elem is None or bz is None or bb is None:
                 continue
-            try:
-                bb = elem.get_BoundingBox(None)
-            except:
-                bb = None
-            if bb is None:
-                continue
-            resid = _z_edge(bb, kind) - (bz[0] if kind == "base" else bz[1])
-            if abs(resid) > tol * 3:
-                moved.add(_eid_int(eid))
+            for (op_bip, kind) in ops:
+                resid = _z_edge(bb, kind) - (bz[0] if kind == "base" else bz[1])
+                if abs(resid) > tol * 3:
+                    moved.add(iid)
+                    break
 
         t.Commit()
     except Exception:
         t.RollBack()
         raise
 
-    # How many elements still reference the old level (blocks safe deletion)?
-    remaining = 0
+    # Which elements still reference the old level (blocks safe deletion)?
+    remaining = set()
     for el in FilteredElementCollector(doc).WhereElementIsNotElementType():
         try:
             if el.Category and el.Category.CategoryType == CategoryType.Model \
                     and not isinstance(el, Level) \
                     and find_associations(el, old_level.Id):
-                remaining += 1
+                remaining.add(_eid_int(el.Id))
         except:
             pass
 
     return {
         'rehosted': rehosted,
         'level_readonly': level_readonly - rehosted,
-        'uncompensated': uncompensated,
         'moved': moved,
         'remaining': remaining,
     }
+
+
+def category_tally(iids):
+    """Sorted [(category_name, count), ...] for a set of element ids."""
+    counts = {}
+    for iid in iids:
+        el = doc.GetElement(ElementId(iid))
+        name = el.Category.Name if (el and el.Category) else "?"
+        counts[name] = counts.get(name, 0) + 1
+    return sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
 
 
 # =====================================================================
@@ -470,32 +496,48 @@ def main():
 
     res = rehost(src, dst, candidates)
 
+    kept = res['rehosted'] - res['moved']
+
     output = script.get_output()
     output.print_md("# Rehost Level: {} -> {}".format(src.Name, dst.Name))
     output.print_md(
         "Elevation difference **{:+.0f} mm** &nbsp;|&nbsp; "
         "Candidates **{}**".format(delta_mm, len(candidates)))
     output.print_md(
-        "- Rehosted (kept in place): **{}**\n"
-        "- Level parameter read-only (could NOT rehost): **{}**\n"
-        "- Rehosted but offset not compensable (may have moved): **{}**\n"
-        "- Still off original elevation after correction: **{}**\n"
-        "- Elements still referencing '{}' after run: **{}**".format(
-            len(res['rehosted']), len(res['level_readonly']),
-            len(res['uncompensated']), len(res['moved']),
-            src.Name, res['remaining']))
-    if res['remaining'] == 0:
+        "- Rehosted & kept in place: **{}**\n"
+        "- Rehosted but still off elevation: **{}**\n"
+        "- Could NOT rehost (level parameter read-only): **{}**\n"
+        "- Elements still referencing '{}': **{}**".format(
+            len(kept), len(res['moved']), len(res['level_readonly']),
+            src.Name, len(res['remaining'])))
+
+    def _dump(title, iids):
+        if not iids:
+            return
+        output.print_md("### {} - by category".format(title))
+        data = [[n, c] for (n, c) in category_tally(iids)]
+        output.print_table(table_data=data, columns=["Category", "Count"])
+
+    _dump("Could NOT rehost (level read-only)", res['level_readonly'])
+    _dump("Rehosted but still off elevation", res['moved'])
+
+    if not res['remaining']:
         output.print_md("### '{}' hosts nothing now - safe to delete "
                         "(this also removes its plan views).".format(src.Name))
     else:
-        output.print_md("### '{}' still hosts {} element(s) - see the "
-                        "read-only/uncompensated lists above before "
-                        "deleting.".format(src.Name, res['remaining']))
+        output.print_md(
+            "### '{}' still hosts {} element(s) - deleting the level now would "
+            "delete them. See the category breakdown above.".format(
+                src.Name, len(res['remaining'])))
 
+    # Select the elements that need attention (read-only + still-off) so they
+    # are easy to inspect; if there are none, select the kept ones.
+    focus = res['level_readonly'] | res['moved']
+    if not focus:
+        focus = kept
     sel = List[ElementId]()
-    for k in ('rehosted', 'level_readonly', 'uncompensated', 'moved'):
-        for iid in res[k]:
-            sel.Add(ElementId(iid))
+    for iid in focus:
+        sel.Add(ElementId(iid))
     try:
         uidoc.Selection.SetElementIds(sel)
     except:
@@ -503,15 +545,15 @@ def main():
 
     summary = (
         "Rehost complete: {} -> {}\n\n"
-        "Rehosted (kept in place): {}\n"
-        "Could not rehost (level read-only): {}\n"
-        "Possibly moved (no offset param): {}\n"
-        "Still off elevation: {}\n\n"
+        "Rehosted & kept in place: {}\n"
+        "Rehosted but still off elevation: {}\n"
+        "Could not rehost (level read-only): {}\n\n"
         "Elements still on '{}': {}\n\n"
-        "Full breakdown is in the output window. Undo with Ctrl+Z if needed."
-    ).format(src.Name, dst.Name, len(res['rehosted']),
-             len(res['level_readonly']), len(res['uncompensated']),
-             len(res['moved']), src.Name, res['remaining'])
+        "A per-category breakdown of the failures is in the output window "
+        "(the elements needing attention are now selected).\n"
+        "Undo with Ctrl+Z if needed."
+    ).format(src.Name, dst.Name, len(kept), len(res['moved']),
+             len(res['level_readonly']), src.Name, len(res['remaining']))
     forms.alert(summary, title=__title__)
 
 
