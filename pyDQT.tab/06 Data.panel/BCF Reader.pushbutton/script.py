@@ -49,6 +49,7 @@ from System.Windows import (
     TextWrapping, FontStyles, FontWeights, CornerRadius,
     GridLength, GridUnitType
 )
+from System.Windows.Threading import Dispatcher
 from System.Windows.Media import BrushConverter, Stretch
 from System.Windows.Media.Imaging import BitmapImage, BitmapCacheOption
 from System.Windows.Controls import (
@@ -263,7 +264,17 @@ class BCFIssue(object):
 
     def build_snapshot_image(self):
         """Build frozen BitmapImage once. Call ms.Dispose() after EndInit()
-        because CacheOption.OnLoad has already copied pixels into memory."""
+        because CacheOption.OnLoad has already copied pixels into memory.
+
+        DecodePixelWidth caps the decode resolution: BCF snapshots come from
+        whatever tool exported them and can be far larger than what's ever
+        shown (a small card thumbnail / a ~220px-tall detail panel image).
+        Decoding at full resolution just to shrink it on display wastes
+        memory and - on some GPU/driver combinations - a very large bitmap
+        being stretched down by WPF's renderer is a real source of hard,
+        unrecoverable crashes that no try/except can catch. Capping the
+        decode size keeps memory and rendering cost bounded regardless of
+        the source image's native resolution."""
         if self.snapshot_image is not None:
             return self.snapshot_image
         if self.snapshot_bytes is None:
@@ -274,6 +285,7 @@ class BCFIssue(object):
                 bi = BitmapImage()
                 bi.BeginInit()
                 bi.CacheOption = BitmapCacheOption.OnLoad
+                bi.DecodePixelWidth = 900
                 bi.StreamSource = ms
                 bi.EndInit()
                 bi.Freeze()
@@ -283,6 +295,9 @@ class BCFIssue(object):
                     ms.Dispose()
                 except Exception:
                     pass
+            if bi.PixelWidth <= 0 or bi.PixelHeight <= 0:
+                self.snapshot_image = None
+                return None
             self.snapshot_image = bi
             return bi
         except Exception:
@@ -664,6 +679,21 @@ class BCFManagerWindow(WPFWindow):
         self._action_handler = ActionHandler()
         self._action_event = ExternalEvent.Create(self._action_handler)
 
+        # Safety net: an exception raised during WPF's own layout/render
+        # pass (e.g. while a control is being measured/arranged after a
+        # click handler has already returned normally) happens OUTSIDE any
+        # try/except in our code and is NOT caught by it. In a Revit-hosted
+        # .NET 8 CoreCLR runtime there is no default "Send Report" dialog
+        # for that case - it silently takes the whole Revit process down.
+        # Hooking the window's own Dispatcher turns that into a readable
+        # TaskDialog (with the real stack trace) instead of a hard crash,
+        # and e.Handled = True tells WPF to continue instead of terminating.
+        try:
+            Dispatcher.CurrentDispatcher.UnhandledException += \
+                self._on_dispatcher_exception
+        except Exception:
+            pass
+
         # Wire events (control names are exposed as attributes by WPFWindow)
         self.btnOpen.Click += self.on_open_click
         self.btnZoom.Click += self.on_zoom_click
@@ -689,6 +719,30 @@ class BCFManagerWindow(WPFWindow):
             self.btnUnresolved.Click += lambda s, e: self.set_filter("UNRESOLVED")
         except AttributeError:
             pass
+
+    # ------------------------------------------------------------------
+    # Global WPF safety net (see comment where this is wired in __init__)
+    # ------------------------------------------------------------------
+    def _on_dispatcher_exception(self, sender, e):
+        try:
+            ex = e.Exception
+            msg = str(ex)
+            try:
+                msg += "\n\n" + str(ex.StackTrace)
+            except Exception:
+                pass
+            self.set_status("UI error (recovered): " + str(ex))
+            TaskDialog.Show(
+                "DQT BCF Reader - Recovered Error",
+                "An internal UI error was caught and Revit was kept open.\n\n"
+                + msg)
+        except Exception:
+            pass
+        finally:
+            try:
+                e.Handled = True
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # File loading
