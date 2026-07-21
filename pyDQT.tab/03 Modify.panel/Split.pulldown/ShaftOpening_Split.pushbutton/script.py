@@ -180,86 +180,50 @@ def get_symbolic_lines(elem, curve_loops):
     return list(found.values())
 
 
-class _SwallowFailures(IFailuresPreprocessor):
-    def PreprocessFailures(self, fa):
-        return FailureProcessingResult.Continue
+def restore_symbolic_lines_as_model_lines(opening_curves_pairs):
+    """Redraw the captured lines as free-standing model lines at their original
+    location. opening_curves_pairs: list of (new_opening, [curves]).
 
-
-def get_element_sketch(elem):
-    try:
-        for did in elem.GetDependentElements(ElementClassFilter(Sketch)):
-            s = doc.GetElement(did)
-            if isinstance(s, Sketch):
-                return s
-    except:
-        pass
-    return None
-
-
-def add_lines_to_opening_sketch(opening, curves):
-    """Add the captured curves back INTO the new opening's own sketch (via
-    SketchEditScope) so they are real sketch members - the same kind
-    (ModelLine / <Sketch>) as the originals - rather than free 2D model lines.
-    Must run OUTSIDE any open transaction (SketchEditScope manages its own).
-    Returns (added, dropped)."""
-    if not curves:
-        return 0, 0
-    sketch = get_element_sketch(opening)
-    if sketch is None:
-        print("  No sketch on new opening - cannot restore sketch lines")
-        return 0, len(curves)
-
-    scope = SketchEditScope(doc, "DQT - Restore shaft sketch lines")
-    try:
-        scope.Start(sketch.Id)
-    except Exception as ex:
-        print("  SketchEditScope.Start failed: {}".format(ex))
-        return 0, len(curves)
-
-    added = 0
-    dropped = 0
-    try:
-        sp = sketch.SketchPlane
-        plane_z = sp.GetPlane().Origin.Z
-        t = Transaction(doc, "DQT - Add sketch lines")
-        t.Start()
-        for curve in curves:
-            try:
-                dz = plane_z - curve.GetEndPoint(0).Z
-                c = curve
-                if abs(dz) > 1e-9:
-                    c = curve.CreateTransformed(
-                        Transform.CreateTranslation(XYZ(0, 0, dz)))
-                doc.Create.NewModelCurve(c, sp)
-                added += 1
-            except Exception:
-                dropped += 1
-        t.Commit()
-        scope.Commit(_SwallowFailures())
-    except Exception as ex:
-        print("  Sketch edit failed ({}) - lines not restored".format(ex))
-        try:
-            scope.Cancel()
-        except:
-            pass
-        return 0, len(curves)
-    return added, dropped
-
-
-def recreate_as_model_lines(curves):
-    """Last-resort fallback: draw the curves as free-standing model lines (2D
-    look, not embedded in the sketch). Returns (created, dropped)."""
+    IMPORTANT - why NOT SketchEditScope: an earlier version pushed these
+    curves back INTO each new opening's own boundary sketch via
+    SketchEditScope so they became real sketch members. But a shaft
+    opening's sketch is a BOUNDARY sketch - it only accepts closed loops.
+    A symbolic mark is an OPEN curve, so when SketchEditScope.Commit()
+    validated the sketch it hit an invalid (open) profile member and Revit
+    terminated the whole process - an unrecoverable native crash that no
+    try/except can catch. Drawing them as ordinary model lines in a normal
+    transaction keeps the marks visually in place with zero risk to the
+    document. Runs in ONE transaction; a bad individual curve is dropped,
+    never fatal."""
     created = 0
     dropped = 0
-    for curve in curves:
-        try:
-            plane = Plane.CreateByNormalAndOrigin(
-                XYZ.BasisZ, XYZ(0, 0, curve.GetEndPoint(0).Z))
-            sp = SketchPlane.Create(doc, plane)
-            doc.Create.NewModelCurve(curve.Clone(), sp)
-            created += 1
-        except:
-            dropped += 1
+    if not any(cs for _, cs in opening_curves_pairs):
+        return 0, 0
+
+    t = Transaction(doc, "DQT - Restore shaft symbolic lines")
+    t.Start()
+    try:
+        plane_cache = {}
+        for _new_opening, curves in opening_curves_pairs:
+            for curve in curves:
+                try:
+                    z = round(curve.GetEndPoint(0).Z, 6)
+                    sp = plane_cache.get(z)
+                    if sp is None:
+                        plane = Plane.CreateByNormalAndOrigin(
+                            XYZ.BasisZ, XYZ(0, 0, z))
+                        sp = SketchPlane.Create(doc, plane)
+                        plane_cache[z] = sp
+                    doc.Create.NewModelCurve(curve, sp)
+                    created += 1
+                except Exception:
+                    dropped += 1
+        t.Commit()
+    except Exception as ex:
+        if t.HasStarted() and not t.HasEnded():
+            t.RollBack()
+        print("  Line restore transaction failed: {}".format(ex))
+        return created, dropped
     return created, dropped
 
 
@@ -483,10 +447,9 @@ def split_shaft(opening):
     print("\nCreating {} separate shaft openings".format(len(main_boundaries)))
 
     # PHASE 1 - create the new openings and delete the original inside one
-    # transaction. Symbolic-line restoration cannot happen here: it needs a
-    # SketchEditScope, which must run with NO transaction open. So we only
-    # remember each (new opening, its boundary loop) pair and defer the line
-    # work to phase 2 after this transaction has committed.
+    # transaction. We remember each (new opening, its boundary loop) pair and
+    # defer redrawing the captured symbolic lines to phase 2, so the line work
+    # runs in its own transaction after the split has committed.
     new_openings = []
     opening_loop_pairs = []
     dropped_holes_total = 0
@@ -523,33 +486,34 @@ def split_shaft(opening):
         print(traceback.format_exc())
         raise e
 
-    # PHASE 2 - restore the captured lines into each new opening's own sketch.
-    # The Curve geometry captured in all_symbolic_lines stays valid even after
-    # the source opening is deleted (they are geometry objects, not live
-    # elements). Each captured curve is assigned to whichever new boundary loop
-    # its midpoint falls inside, then added as a real sketch member.
+    # PHASE 2 - redraw the captured lines as free-standing model lines. The
+    # Curve geometry captured in all_symbolic_lines stays valid even after the
+    # source opening is deleted (they are geometry objects, not live elements).
+    # Each captured curve is assigned to whichever new boundary loop its
+    # midpoint falls inside (purely so a line only shows where its opening is),
+    # then all are drawn in a single, safe transaction.
     symbolic_created_total = 0
     symbolic_dropped_total = 0
     if all_symbolic_lines:
         line_curves = [c for (_eid, c, _sid) in all_symbolic_lines]
+        pairs = []
+        assigned = set()
         for new_opening, loop in opening_loop_pairs:
             curves_here = []
-            for c in line_curves:
+            for i, c in enumerate(line_curves):
+                if i in assigned:
+                    continue
                 mid = _curve_midpoint(c)
                 if mid is not None and point_in_loop(mid, loop):
                     curves_here.append(c)
-            if not curves_here:
-                continue
-            print("\nRestoring {} sketch line(s) into opening {}".format(
-                len(curves_here), _eid_int(new_opening.Id)))
-            added, dropped = add_lines_to_opening_sketch(new_opening, curves_here)
-            if added == 0 and dropped:
-                # SketchEditScope path failed - fall back to plain model lines
-                # so the marks are at least visually restored.
-                print("  Sketch-member restore failed - drawing model lines")
-                added, dropped = recreate_as_model_lines(curves_here)
-            symbolic_created_total += added
-            symbolic_dropped_total += dropped
+                    assigned.add(i)
+            if curves_here:
+                print("\nRestoring {} line(s) for opening {}".format(
+                    len(curves_here), _eid_int(new_opening.Id)))
+                pairs.append((new_opening, curves_here))
+        if pairs:
+            symbolic_created_total, symbolic_dropped_total = \
+                restore_symbolic_lines_as_model_lines(pairs)
 
     return (new_openings, dropped_holes_total,
             symbolic_created_total, symbolic_dropped_total)
