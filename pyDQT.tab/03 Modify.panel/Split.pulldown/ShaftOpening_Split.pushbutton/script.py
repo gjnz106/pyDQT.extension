@@ -4,26 +4,28 @@ Split Shaft Opening Tool
 
 Splits a shaft opening that has several disconnected boundary loops into
 separate individual shaft openings - one per boundary - while preserving
-EVERYTHING the original held: all instance parameters, any holes, and the
-user-drawn Symbolic Lines inside the boundaries.
+everything the original held: all instance parameters, any holes, and the
+user-drawn symbolic lines inside the boundaries.
 
-Method (this mirrors the manual Revit workflow that reliably keeps
-symbolic lines, requested by the user):
-
+Method (mirrors the manual Revit workflow that reliably keeps symbolic
+lines):
   For each outer boundary of the original shaft:
-    1. COPY the whole shaft in place (Copy + Paste Aligned / Same Place).
-       The copy already contains every boundary, every hole and every
-       symbolic line as real sketch members - nothing is recreated.
-    2. EDIT that copy's sketch and DELETE every loop / line that does NOT
-       belong to the boundary we are keeping.
+    1. COPY the whole shaft in place. The copy already contains every
+       boundary, hole and symbolic line as real sketch members.
+    2. EDIT that copy's sketch and DELETE the loops that belong to other
+       openings, leaving one boundary (plus its holes / interior lines).
   Finally the original multi-boundary shaft is deleted.
 
-Why this does not crash like the earlier version: we only ever DELETE
-complete loops from an already-valid sketch. We never inject a new open
-curve into a boundary sketch - injecting open curves is what made
-SketchEditScope.Commit() validate an invalid profile and take Revit down.
-Removing whole loops leaves a still-valid sketch (one closed outer loop,
-its holes, and the symbolic lines that were always legal members).
+CRITICAL correctness/stability rules (a shaft sketch requires EVERY line to
+belong to a CLOSED loop; leaving a loop open produces an "Error - cannot be
+ignored" that crashes Revit):
+  * Sketch curves are grouped into connected components (chains sharing
+    endpoints). We only ever keep or delete WHOLE components, so a boundary
+    loop can never be left half-deleted / open.
+  * Before committing the sketch edit we verify the surviving curves still
+    form closed loops. If they don't, we CANCEL the edit instead of
+    committing - turning what used to be an un-ignorable crash into a
+    safely-reported failure.
 
 Dang Quoc Truong - DQT (c) 2026
 """
@@ -39,10 +41,9 @@ from System.Collections.Generic import List
 doc = revit.doc
 uidoc = revit.uidoc
 
-# Endpoint-match tolerance in feet (~0.0003 mm). Copied curves are exact
-# copies of the original profile curves, so this only needs to absorb
-# floating-point noise.
-TOL = 1e-6
+# Connectivity / endpoint-match tolerance in feet (~0.03 mm). Boundary
+# vertices of a sketch coincide exactly; this only absorbs float noise.
+TOL = 1e-4
 
 
 def _eid_int(eid):
@@ -55,8 +56,8 @@ def _eid_int(eid):
 
 
 class _SwallowFailures(IFailuresPreprocessor):
-    """Silences the 'duplicate/overlapping elements' style warnings that appear
-    while copies briefly overlap - they are expected and harmless here."""
+    """Silences the expected 'duplicate/overlapping elements' warnings while
+    copies briefly overlap."""
     def PreprocessFailures(self, fa):
         return FailureProcessingResult.Continue
 
@@ -83,22 +84,6 @@ def get_sketch(elem):
     return None
 
 
-def get_boundary_loops(sketch):
-    """CurveLoop for each profile loop of the sketch (boundaries + holes)."""
-    loops = []
-    if sketch is None:
-        return loops
-    try:
-        for curve_array in sketch.Profile:
-            cl = CurveLoop()
-            for c in curve_array:
-                cl.Append(c)
-            loops.append(cl)
-    except Exception as ex:
-        print("  Could not read sketch profile: {}".format(ex))
-    return loops
-
-
 def _midpoint(curve):
     try:
         return curve.Evaluate(0.5, True)
@@ -109,8 +94,9 @@ def _midpoint(curve):
             return None
 
 
-def point_in_loop(point, loop):
-    """Even-odd horizontal ray-cast point-in-polygon test against a loop."""
+def point_in_loop(point, curves):
+    """Even-odd horizontal ray-cast point-in-polygon test against a set of
+    curves that form a closed ring (order does not matter)."""
     if point is None:
         return False
     ray_end = XYZ(point.X + 10000.0, point.Y, point.Z)
@@ -119,7 +105,7 @@ def point_in_loop(point, loop):
     except:
         return False
     count = 0
-    for curve in loop:
+    for curve in curves:
         try:
             if curve.Intersect(ray) == DB.SetComparisonResult.Overlap:
                 count += 1
@@ -128,67 +114,9 @@ def point_in_loop(point, loop):
     return count % 2 == 1
 
 
-def _loop_first_point(loop):
-    for c in loop:
-        return c.GetEndPoint(0)
-    return None
-
-
-def loop_is_inside(inner, outer):
-    return point_in_loop(_loop_first_point(inner), outer)
-
-
-def loop_bbox_area(loop):
-    pts = []
-    for c in loop:
-        pts.append(c.GetEndPoint(0))
-        pts.append(c.GetEndPoint(1))
-    if not pts:
-        return 0.0
-    return (max(p.X for p in pts) - min(p.X for p in pts)) * \
-           (max(p.Y for p in pts) - min(p.Y for p in pts))
-
-
-def find_outer_loops(loops):
-    """Subset of loops that are outer boundaries (not holes nested in a bigger
-    loop). Each becomes one separate shaft opening."""
-    data = [{'loop': l, 'area': loop_bbox_area(l)} for l in loops]
-    data.sort(key=lambda d: d['area'], reverse=True)
-    outers = []
-    for i in range(len(data)):
-        is_hole = False
-        for j in range(len(data)):
-            if i == j:
-                continue
-            if data[j]['area'] > data[i]['area'] and \
-                    loop_is_inside(data[i]['loop'], data[j]['loop']):
-                is_hole = True
-                break
-        if not is_hole:
-            outers.append(data[i]['loop'])
-    return outers
-
-
-def _is_edge_of_loop(g, loop, tol):
-    """True if curve g coincides with one of loop's edges (endpoints match in
-    either direction, confirmed by midpoint to disambiguate arcs)."""
-    a = g.GetEndPoint(0)
-    b = g.GetEndPoint(1)
-    mg = _midpoint(g)
-    for lc in loop:
-        la = lc.GetEndPoint(0)
-        lb = lc.GetEndPoint(1)
-        if (a.DistanceTo(la) < tol and b.DistanceTo(lb) < tol) or \
-                (a.DistanceTo(lb) < tol and b.DistanceTo(la) < tol):
-            ml = _midpoint(lc)
-            if mg is None or ml is None or mg.DistanceTo(ml) < max(tol * 100, 1e-4):
-                return True
-    return False
-
-
 def collect_sketch_curves(sketch):
-    """Dependent elements of the sketch that expose a GeometryCurve (boundary
-    edges + symbolic lines). Returns [(element, curve)]."""
+    """[(element, curve)] for every dependent of the sketch that exposes a
+    GeometryCurve (boundary edges + any symbolic lines)."""
     out = []
     seen = set()
     try:
@@ -211,68 +139,223 @@ def collect_sketch_curves(sketch):
     return out
 
 
-def trim_copy_to_outer_loop(copy, outer_loop):
-    """Edit the copy's sketch, deleting every curve that is NOT an edge of
-    outer_loop and NOT inside it. Keeps outer_loop's edges, any holes inside
-    it, and the symbolic lines that fall inside it.
+def _share_endpoint(c1, c2, tol):
+    p = [c1.GetEndPoint(0), c1.GetEndPoint(1)]
+    q = [c2.GetEndPoint(0), c2.GetEndPoint(1)]
+    for a in p:
+        for b in q:
+            if a.DistanceTo(b) < tol:
+                return True
+    return False
 
-    Runs its own SketchEditScope + transaction, so it must be called with NO
-    transaction open. Returns (kept, deleted)."""
+
+def build_components(curve_items, tol):
+    """Group [(element, curve)] into connected components by shared endpoints.
+    Returns a list of components, each a list of (element, curve)."""
+    n = len(curve_items)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i in range(n):
+        ci = curve_items[i][1]
+        for j in range(i + 1, n):
+            if _share_endpoint(ci, curve_items[j][1], tol):
+                union(i, j)
+
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(curve_items[i])
+    return list(groups.values())
+
+
+def _component_points(comp):
+    pts = []
+    for (_e, c) in comp:
+        pts.append(c.GetEndPoint(0))
+        pts.append(c.GetEndPoint(1))
+    return pts
+
+
+def curves_closed(curve_list, tol):
+    """True if these curves form closed loops only - every endpoint is shared
+    by an even number of curve ends (a free/open end has an odd count)."""
+    pts = []
+    for c in curve_list:
+        pts.append(c.GetEndPoint(0))
+        pts.append(c.GetEndPoint(1))
+    used = [False] * len(pts)
+    for i in range(len(pts)):
+        if used[i]:
+            continue
+        cnt = 0
+        for j in range(len(pts)):
+            if not used[j] and pts[i].DistanceTo(pts[j]) < tol:
+                used[j] = True
+                cnt += 1
+        if cnt % 2 != 0:
+            return False
+    return True
+
+
+def _comp_is_closed(comp, tol):
+    return curves_closed([c for (_e, c) in comp], tol)
+
+
+def _comp_area(comp):
+    pts = _component_points(comp)
+    if not pts:
+        return 0.0
+    return (max(p.X for p in pts) - min(p.X for p in pts)) * \
+           (max(p.Y for p in pts) - min(p.Y for p in pts))
+
+
+def _comp_centroid(comp):
+    pts = _component_points(comp)
+    if not pts:
+        return XYZ(0, 0, 0)
+    return XYZ(sum(p.X for p in pts) / len(pts),
+               sum(p.Y for p in pts) / len(pts),
+               sum(p.Z for p in pts) / len(pts))
+
+
+def _comp_curves(comp):
+    return [c for (_e, c) in comp]
+
+
+def _comp_rep_point(comp):
+    for (_e, c) in comp:
+        return _midpoint(c)
+    return None
+
+
+def outer_components(components, tol):
+    """Closed components that are not nested inside a larger closed component -
+    i.e. the separate openings. Returned in a deterministic order so the same
+    index picks the same opening across identical copies."""
+    closed = [c for c in components if _comp_is_closed(c, tol)]
+    outers = []
+    for c in closed:
+        ac = _comp_area(c)
+        nested = False
+        for d in closed:
+            if d is c:
+                continue
+            if _comp_area(d) > ac and point_in_loop(_comp_rep_point(c),
+                                                     _comp_curves(d)):
+                nested = True
+                break
+        if not nested:
+            outers.append(c)
+    outers.sort(key=lambda c: (round(_comp_area(c), 6),
+                               round(_comp_centroid(c).X, 4),
+                               round(_comp_centroid(c).Y, 4)))
+    return outers
+
+
+def count_openings(opening):
+    """How many separate outer boundaries this shaft has."""
+    sketch = get_sketch(opening)
+    if sketch is None:
+        return 0
+    comps = build_components(collect_sketch_curves(sketch), TOL)
+    return len(outer_components(comps, TOL))
+
+
+def trim_copy_to_index(copy, keep_index):
+    """Edit the copy's sketch to keep only the keep_index-th outer boundary
+    (plus the holes / lines inside it), deleting every other whole component.
+    Validates before committing and cancels instead of leaving an open loop.
+    Returns (ok, message)."""
     sketch = get_sketch(copy)
     if sketch is None:
-        print("  Copy has no sketch - cannot trim")
-        return 0, 0
+        return False, "copy has no sketch"
 
-    curves = collect_sketch_curves(sketch)
-    keep = 0
+    comps = build_components(collect_sketch_curves(sketch), TOL)
+    outers = outer_components(comps, TOL)
+    if keep_index >= len(outers):
+        return False, "outer boundary index {} of {} missing".format(
+            keep_index, len(outers))
+
+    target = outers[keep_index]
+    target_curves = _comp_curves(target)
+
+    keep_ids = set()
     del_ids = []
-    for (e, g) in curves:
-        if _is_edge_of_loop(g, outer_loop, TOL):
-            keep += 1                                   # edge of kept loop
-        elif point_in_loop(_midpoint(g), outer_loop):
-            keep += 1                                   # hole edge / symbolic line inside
+    kept_curves = []
+    for comp in comps:
+        if comp is target:
+            keep = True
         else:
-            del_ids.append(e.Id)                        # belongs to another opening
+            keep = point_in_loop(_comp_rep_point(comp), target_curves)
+        if keep:
+            for (e, c) in comp:
+                keep_ids.add(_eid_int(e.Id))
+                kept_curves.append(c)
+        else:
+            for (e, c) in comp:
+                del_ids.append(e.Id)
 
     if not del_ids:
-        return keep, 0
+        return True, "single boundary, nothing to trim"
+
+    # Guard: never commit a sketch whose survivors are not closed loops.
+    if not curves_closed(kept_curves, TOL):
+        return False, "surviving curves would be open - not attempted"
 
     scope = SketchEditScope(doc, "DQT - Trim shaft copy")
     scope.Start(sketch.Id)
-    t = Transaction(doc, "DQT - Remove other boundaries")
+    t = Transaction(doc, "DQT - Remove other openings")
     t.Start()
-    deleted = 0
     for cid in del_ids:
         try:
             doc.Delete(cid)
-            deleted += 1
         except:
             pass
     t.Commit()
-    scope.Commit(_SwallowFailures())
-    return keep, deleted
+
+    # Re-verify against the ACTUAL surviving sketch curves (not just our
+    # pre-image) before the scope commits; cancel on any doubt so Revit never
+    # raises the un-ignorable "lines must be in closed loops" crash.
+    try:
+        survivors = [c for (_e, c) in collect_sketch_curves(sketch)]
+    except:
+        survivors = kept_curves
+    if not survivors or not curves_closed(survivors, TOL):
+        scope.Cancel()
+        return False, "post-delete sketch not closed - cancelled safely"
+
+    try:
+        scope.Commit(_SwallowFailures())
+    except Exception as ex:
+        try:
+            scope.Cancel()
+        except:
+            pass
+        return False, "sketch commit failed: {}".format(ex)
+    return True, "ok"
 
 
 def split_shaft(opening):
-    """Split one multi-boundary shaft opening into N single-boundary openings
-    by copy-in-place + trim. Returns (created, failed, n) or None if nothing
-    to split."""
-    sketch = get_sketch(opening)
-    loops = get_boundary_loops(sketch)
-    if len(loops) <= 1:
-        print("  Shaft has only one boundary - skipping")
-        return None
-
-    outer_loops = find_outer_loops(loops)
-    n = len(outer_loops)
+    """Split one multi-boundary shaft into N single-boundary openings by
+    copy-in-place + trim. Returns (created, failed, n) or None."""
+    n = count_openings(opening)
     if n <= 1:
-        print("  Only one outer boundary (rest are holes) - skipping")
+        print("  Shaft has one boundary (or unreadable) - skipping")
         return None
 
-    print("  {} loops in sketch -> {} separate openings".format(len(loops), n))
+    print("  {} separate openings detected".format(n))
 
-    # PHASE A - copy the whole shaft in place, once per outer boundary. Each
-    # copy is a full duplicate (all boundaries, holes and symbolic lines).
+    # PHASE A - copy the whole shaft in place, once per outer boundary.
     src = List[ElementId]()
     src.Add(opening.Id)
     copy_ids = []
@@ -295,28 +378,27 @@ def split_shaft(opening):
         copy_ids.append(oid)
     t1.Commit()
 
-    # PHASE B - trim each copy down to a single outer boundary. Uses
-    # SketchEditScope, which must run with NO transaction open, so it lives
-    # outside phase A's transaction.
+    # PHASE B - trim each copy to a single outer boundary (SketchEditScope,
+    # no open transaction).
     created = 0
     failed = 0
     for i, cid in enumerate(copy_ids):
         copy = doc.GetElement(cid) if cid is not None else None
         if copy is None:
             failed += 1
-            print("  Opening {}: copy missing - skipped".format(i + 1))
+            print("  Opening {}: copy missing".format(i + 1))
             continue
         try:
-            kept, deleted = trim_copy_to_outer_loop(copy, outer_loops[i])
-            print("  Opening {}: kept {} curve(s), removed {}".format(
-                i + 1, kept, deleted))
-            created += 1
+            ok, msg = trim_copy_to_index(copy, i)
         except Exception as ex:
+            ok, msg = False, "exception: {}".format(ex)
+        print("  Opening {}: {}".format(i + 1, msg))
+        if ok:
+            created += 1
+        else:
             failed += 1
-            print("  Opening {}: trim FAILED ({}) - removing partial copy".format(
-                i + 1, ex))
-            # A copy we could not trim is a full duplicate overlapping the
-            # others; remove it so we do not leave junk behind.
+            # Remove the copy we could not trim so we do not leave a full
+            # duplicate overlapping the others.
             td = Transaction(doc, "DQT - Remove failed copy")
             td.Start()
             try:
@@ -325,14 +407,19 @@ def split_shaft(opening):
                 pass
             td.Commit()
 
-    # PHASE C - delete the original multi-boundary shaft.
-    t2 = Transaction(doc, "DQT - Delete original shaft")
-    t2.Start()
-    try:
-        doc.Delete(opening.Id)
-    except Exception as ex:
-        print("  Could not delete original shaft: {}".format(ex))
-    t2.Commit()
+    # PHASE C - delete the original only if every opening was created; if any
+    # failed, keep the original so nothing is lost (user can retry / undo).
+    if created == n:
+        t2 = Transaction(doc, "DQT - Delete original shaft")
+        t2.Start()
+        try:
+            doc.Delete(opening.Id)
+        except Exception as ex:
+            print("  Could not delete original shaft: {}".format(ex))
+        t2.Commit()
+    else:
+        print("  Kept the ORIGINAL shaft ({}/{} openings created) - review "
+              "before deleting it manually.".format(created, n))
 
     return created, failed, n
 
@@ -343,8 +430,7 @@ def main():
             "Split shaft openings that have several disconnected boundaries "
             "into separate single-boundary openings.\n\n"
             "Each new opening is a COPY of the original trimmed to one "
-            "boundary, so parameters, holes and user-drawn symbolic lines are "
-            "kept.\n\n"
+            "boundary, so parameters, holes and symbolic lines are kept.\n\n"
             "Click OK, then pick the shaft opening(s) to split.\n"
             "Press ESC or Finish when done.",
             title="Split Shaft Opening Tool",
@@ -396,8 +482,7 @@ def main():
                 total_failed += failed
                 if created > 0:
                     successful_splits += 1
-                print("Result: {} new opening(s) created, {} failed".format(
-                    created, failed))
+                print("Result: {} created, {} failed".format(created, failed))
             except Exception as e:
                 total_failed += 1
                 import traceback
@@ -424,10 +509,13 @@ def main():
         if skipped:
             msg += "\nSkipped (only one boundary): {}".format(skipped)
         if total_failed:
-            msg += "\n\n{} opening(s) could not be created - see the output " \
-                   "window for details.".format(total_failed)
-        msg += ("\n\nParameters, holes and symbolic lines were kept "
-                "(each opening is a trimmed copy of the original).")
+            msg += ("\n\n{} opening(s) could not be created (handled safely - "
+                    "no crash). The original shaft was kept where any opening "
+                    "failed; see the output window for the exact reason."
+                    ).format(total_failed)
+        else:
+            msg += ("\n\nParameters, holes and symbolic lines were kept "
+                    "(each opening is a trimmed copy of the original).")
         forms.alert(msg, title="Split Shaft Opening Summary")
 
     except Exception as e:
