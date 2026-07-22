@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 Check Update - DQT
-Tells the user whether the installed pyDQT is up to date or a newer version is
-available, by comparing the local git commit with the latest commit on GitHub.
+Tells the user whether the installed pyDQT-Design is up to date or a newer
+version is available, by comparing the local git commit with the latest
+commit on GitHub.
 
 Copyright (c) 2026 Dang Quoc Truong (DQT)
 All rights reserved.
@@ -10,7 +11,7 @@ All rights reserved.
 
 __title__ = "Check\nUpdate"
 __author__ = "Dang Quoc Truong (DQT)"
-__doc__ = "Check whether your pyDQT is the latest version (compares with GitHub)."
+__doc__ = "Check whether your pyDQT-Design is the latest version (compares with GitHub)."
 
 import os
 import re
@@ -21,7 +22,7 @@ from System.Net import ServicePointManager, SecurityProtocolType
 
 from pyrevit import forms, script
 
-REPO = "gjnz106/pyDQT.extension"
+REPO = "gjnz106/pyDQT-Design.extension"
 DEFAULT_BRANCH = "main"
 
 
@@ -87,11 +88,11 @@ def main():
 
     if local is None:
         forms.alert(
-            "Cannot read the local version - pyDQT does not look like a git "
-            "install.\n\nTo enable one-click updates, install pyDQT through "
-            "pyRevit > Extension Manager using the Git URL:\n"
-            "https://github.com/{}.git".format(REPO),
-            title="pyDQT - Check Update")
+            "Cannot read the local version - pyDQT-Design does not look "
+            "like a git install.\n\nTo enable one-click updates, install "
+            "pyDQT-Design through pyRevit > Extension Manager using the Git "
+            "URL:\nhttps://github.com/{}.git".format(REPO),
+            title="pyDQT-Design - Check Update")
         return
 
     try:
@@ -100,12 +101,12 @@ def main():
         forms.alert(
             "Could not reach GitHub to check for updates.\n"
             "Check your internet connection and try again.\n\n{}".format(ex),
-            title="pyDQT - Check Update")
+            title="pyDQT-Design - Check Update")
         return
 
     if not remote:
         forms.alert("Could not read the latest version from GitHub.",
-                    title="pyDQT - Check Update")
+                    title="pyDQT-Design - Check Update")
         return
 
     lshort, rshort = local[:7], remote[:7]
@@ -113,17 +114,17 @@ def main():
         forms.alert(
             "You are up to date.\n\nInstalled version: {}\n"
             "Latest on GitHub:  {}".format(lshort, rshort),
-            title="pyDQT - Check Update")
+            title="pyDQT-Design - Check Update")
     else:
         forms.alert(
-            "A new version of pyDQT is available!\n\n"
+            "A new version of pyDQT-Design is available!\n\n"
             "Installed version: {}\n"
             "Latest on GitHub:  {}\n\n"
             "How to update:\n"
             " - pyRevit ribbon > Update, then Reload, or\n"
             " - run 'git pull' in the extension folder, then Reload."
             .format(lshort, rshort),
-            title="pyDQT - Check Update")
+            title="pyDQT-Design - Check Update")
 
 
 if __name__ == "__main__":
