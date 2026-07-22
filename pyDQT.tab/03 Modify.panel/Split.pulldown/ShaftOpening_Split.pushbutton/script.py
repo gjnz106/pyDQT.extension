@@ -178,14 +178,6 @@ def build_components(curve_items, tol):
     return list(groups.values())
 
 
-def _component_points(comp):
-    pts = []
-    for (_e, c) in comp:
-        pts.append(c.GetEndPoint(0))
-        pts.append(c.GetEndPoint(1))
-    return pts
-
-
 def curves_closed(curve_list, tol):
     """True if these curves form closed loops only - every endpoint is shared
     by an even number of curve ends (a free/open end has an odd count)."""
@@ -207,106 +199,128 @@ def curves_closed(curve_list, tol):
     return True
 
 
-def _comp_is_closed(comp, tol):
-    return curves_closed([c for (_e, c) in comp], tol)
-
-
-def _comp_area(comp):
-    pts = _component_points(comp)
-    if not pts:
-        return 0.0
-    return (max(p.X for p in pts) - min(p.X for p in pts)) * \
-           (max(p.Y for p in pts) - min(p.Y for p in pts))
-
-
-def _comp_centroid(comp):
-    pts = _component_points(comp)
-    if not pts:
-        return XYZ(0, 0, 0)
-    return XYZ(sum(p.X for p in pts) / len(pts),
-               sum(p.Y for p in pts) / len(pts),
-               sum(p.Z for p in pts) / len(pts))
-
-
-def _comp_curves(comp):
-    return [c for (_e, c) in comp]
-
-
 def _comp_rep_point(comp):
     for (_e, c) in comp:
         return _midpoint(c)
     return None
 
 
-def outer_components(components, tol):
-    """Closed components that are not nested inside a larger closed component -
-    i.e. the separate openings. Returned in a deterministic order so the same
-    index picks the same opening across identical copies."""
-    closed = [c for c in components if _comp_is_closed(c, tol)]
+# ---------------------------------------------------------------------------
+# Opening DETECTION uses Sketch.Profile - the proven-reliable source for how
+# many boundary loops the shaft has (the same source the original working tool
+# used). The element-component machinery above is used only for the safe
+# WHOLE-loop deletion during trimming.
+# ---------------------------------------------------------------------------
+
+def get_profile_loops(sketch):
+    """List of loops (each a list of Curve) from the sketch profile."""
+    loops = []
+    if sketch is None:
+        return loops
+    try:
+        for curve_array in sketch.Profile:
+            curves = [c for c in curve_array]
+            if curves:
+                loops.append(curves)
+    except Exception as ex:
+        print("  Could not read sketch profile: {}".format(ex))
+    return loops
+
+
+def _loop_area(curves):
+    pts = []
+    for c in curves:
+        pts.append(c.GetEndPoint(0))
+        pts.append(c.GetEndPoint(1))
+    if not pts:
+        return 0.0
+    return (max(p.X for p in pts) - min(p.X for p in pts)) * \
+           (max(p.Y for p in pts) - min(p.Y for p in pts))
+
+
+def _loop_first_point(curves):
+    for c in curves:
+        return c.GetEndPoint(0)
+    return None
+
+
+def find_outer_loops(loops):
+    """The loops that are NOT nested inside a larger loop - i.e. the separate
+    openings (holes are excluded). Deterministic order."""
+    data = [(l, _loop_area(l)) for l in loops]
+    data.sort(key=lambda d: d[1], reverse=True)
     outers = []
-    for c in closed:
-        ac = _comp_area(c)
+    for (l, a) in data:
         nested = False
-        for d in closed:
-            if d is c:
+        for (m, am) in data:
+            if m is l:
                 continue
-            if _comp_area(d) > ac and point_in_loop(_comp_rep_point(c),
-                                                     _comp_curves(d)):
+            if am > a and point_in_loop(_loop_first_point(l), m):
                 nested = True
                 break
         if not nested:
-            outers.append(c)
-    outers.sort(key=lambda c: (round(_comp_area(c), 6),
-                               round(_comp_centroid(c).X, 4),
-                               round(_comp_centroid(c).Y, 4)))
+            outers.append(l)
     return outers
 
 
-def count_openings(opening):
-    """How many separate outer boundaries this shaft has."""
+def get_outer_openings(opening):
+    """List of outer boundary loops (each a list of Curve) for this shaft."""
     sketch = get_sketch(opening)
     if sketch is None:
-        return 0
-    comps = build_components(collect_sketch_curves(sketch), TOL)
-    return len(outer_components(comps, TOL))
+        return []
+    return find_outer_loops(get_profile_loops(sketch))
 
 
-def trim_copy_to_index(copy, keep_index):
-    """Edit the copy's sketch to keep only the keep_index-th outer boundary
-    (plus the holes / lines inside it), deleting every other whole component.
-    Validates before committing and cancels instead of leaving an open loop.
-    Returns (ok, message)."""
+def _point_on_loop(point, curves, tol):
+    """True if point lies on one of the loop's curves (within tol)."""
+    if point is None:
+        return False
+    for c in curves:
+        try:
+            if c.Distance(point) < tol:
+                return True
+        except:
+            pass
+    return False
+
+
+def trim_copy_to_outer_loop(copy, target_curves):
+    """Edit the copy's sketch to keep only the boundary at target_curves (plus
+    the holes / lines inside it), deleting every OTHER whole connected
+    component. Validates before committing and cancels instead of leaving an
+    open loop. Returns (ok, message)."""
     sketch = get_sketch(copy)
     if sketch is None:
         return False, "copy has no sketch"
 
-    comps = build_components(collect_sketch_curves(sketch), TOL)
-    outers = outer_components(comps, TOL)
-    if keep_index >= len(outers):
-        return False, "outer boundary index {} of {} missing".format(
-            keep_index, len(outers))
+    curve_items = collect_sketch_curves(sketch)
+    comps = build_components(curve_items, TOL)
+    print("      copy sketch: {} curve(s) in {} component(s)".format(
+        len(curve_items), len(comps)))
 
-    target = outers[keep_index]
-    target_curves = _comp_curves(target)
-
-    keep_ids = set()
+    on_tol = TOL * 10.0
     del_ids = []
     kept_curves = []
+    kept_comps = 0
     for comp in comps:
-        if comp is target:
-            keep = True
-        else:
-            keep = point_in_loop(_comp_rep_point(comp), target_curves)
+        rep = _comp_rep_point(comp)
+        # Keep this component if it is the target boundary itself (its edges
+        # lie ON the target loop) or it sits inside the target boundary
+        # (a hole or a symbolic line of this opening).
+        keep = _point_on_loop(rep, target_curves, on_tol) or \
+            point_in_loop(rep, target_curves)
         if keep:
-            for (e, c) in comp:
-                keep_ids.add(_eid_int(e.Id))
+            kept_comps += 1
+            for (_e, c) in comp:
                 kept_curves.append(c)
         else:
-            for (e, c) in comp:
+            for (e, _c) in comp:
                 del_ids.append(e.Id)
 
     if not del_ids:
-        return True, "single boundary, nothing to trim"
+        # With a genuine multi-boundary shaft there must be other components to
+        # remove; none found means the curve collection did not see them.
+        return False, "no other components found to remove (collection issue)"
 
     # Guard: never commit a sketch whose survivors are not closed loops.
     if not curves_closed(kept_curves, TOL):
@@ -348,12 +362,14 @@ def trim_copy_to_index(copy, keep_index):
 def split_shaft(opening):
     """Split one multi-boundary shaft into N single-boundary openings by
     copy-in-place + trim. Returns (created, failed, n) or None."""
-    n = count_openings(opening)
+    outer_loops = get_outer_openings(opening)
+    n = len(outer_loops)
+    total_loops = len(get_profile_loops(get_sketch(opening)))
+    print("  Sketch profile: {} loop(s), {} outer opening(s)".format(
+        total_loops, n))
     if n <= 1:
         print("  Shaft has one boundary (or unreadable) - skipping")
         return None
-
-    print("  {} separate openings detected".format(n))
 
     # PHASE A - copy the whole shaft in place, once per outer boundary.
     src = List[ElementId]()
@@ -389,7 +405,7 @@ def split_shaft(opening):
             print("  Opening {}: copy missing".format(i + 1))
             continue
         try:
-            ok, msg = trim_copy_to_index(copy, i)
+            ok, msg = trim_copy_to_outer_loop(copy, outer_loops[i])
         except Exception as ex:
             ok, msg = False, "exception: {}".format(ex)
         print("  Opening {}: {}".format(i + 1, msg))
