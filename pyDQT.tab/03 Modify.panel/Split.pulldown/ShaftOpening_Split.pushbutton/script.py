@@ -284,14 +284,37 @@ def _point_on_loop(point, curves, tol):
     return False
 
 
+def _is_boundary_curve(curve, ref_boundary_curves, tol):
+    """A sketch curve is a BOUNDARY curve (must belong to a closed loop) if its
+    midpoint lies on one of the sketch's profile edges. Everything else is a
+    symbolic line, which Revit allows to be OPEN and must be ignored by the
+    closed-loop validation. Tested by point-on-geometry, so it is immune to the
+    Profile-vs-element curve-splitting mismatch."""
+    return _point_on_loop(_midpoint(curve), ref_boundary_curves, tol)
+
+
+def boundary_closed(curves, ref_boundary_curves, tol):
+    """True if the BOUNDARY curves among 'curves' form closed loops. Symbolic
+    (open) lines are excluded so they never make this fail."""
+    bnd = [c for c in curves
+           if _is_boundary_curve(c, ref_boundary_curves, tol * 10.0)]
+    return curves_closed(bnd, tol)
+
+
 def trim_copy_to_outer_loop(copy, target_curves):
     """Edit the copy's sketch to keep only the boundary at target_curves (plus
-    the holes / lines inside it), deleting every OTHER whole connected
-    component. Validates before committing and cancels instead of leaving an
-    open loop. Returns (ok, message)."""
+    the holes / symbolic lines inside it), deleting every OTHER whole connected
+    component. Only the BOUNDARY loops are required to stay closed - symbolic
+    lines are allowed to remain open. Cancels rather than committing anything
+    that would leave a boundary open (the un-ignorable crash). Returns
+    (ok, message)."""
     sketch = get_sketch(copy)
     if sketch is None:
         return False, "copy has no sketch"
+
+    # All profile edges of this copy - used to tell boundary curves from
+    # symbolic lines during validation.
+    ref_boundary = [c for loop in get_profile_loops(sketch) for c in loop]
 
     curve_items = collect_sketch_curves(sketch)
     comps = build_components(curve_items, TOL)
@@ -301,16 +324,14 @@ def trim_copy_to_outer_loop(copy, target_curves):
     on_tol = TOL * 10.0
     del_ids = []
     kept_curves = []
-    kept_comps = 0
     for comp in comps:
         rep = _comp_rep_point(comp)
-        # Keep this component if it is the target boundary itself (its edges
-        # lie ON the target loop) or it sits inside the target boundary
-        # (a hole or a symbolic line of this opening).
+        # Keep this whole component if it is the target boundary itself (edges
+        # lie ON the target loop) or it sits inside the target boundary (a hole
+        # or a symbolic line of this opening).
         keep = _point_on_loop(rep, target_curves, on_tol) or \
             point_in_loop(rep, target_curves)
         if keep:
-            kept_comps += 1
             for (_e, c) in comp:
                 kept_curves.append(c)
         else:
@@ -318,13 +339,14 @@ def trim_copy_to_outer_loop(copy, target_curves):
                 del_ids.append(e.Id)
 
     if not del_ids:
-        # With a genuine multi-boundary shaft there must be other components to
-        # remove; none found means the curve collection did not see them.
+        # A genuine multi-boundary shaft must have other components to remove;
+        # none found means the curve collection did not see them.
         return False, "no other components found to remove (collection issue)"
 
-    # Guard: never commit a sketch whose survivors are not closed loops.
-    if not curves_closed(kept_curves, TOL):
-        return False, "surviving curves would be open - not attempted"
+    # Guard: never commit if the surviving BOUNDARY would be open. (Symbolic
+    # lines are allowed to be open and are excluded from this check.)
+    if not boundary_closed(kept_curves, ref_boundary, TOL):
+        return False, "surviving boundary would be open - not attempted"
 
     scope = SketchEditScope(doc, "DQT - Trim shaft copy")
     scope.Start(sketch.Id)
@@ -337,16 +359,16 @@ def trim_copy_to_outer_loop(copy, target_curves):
             pass
     t.Commit()
 
-    # Re-verify against the ACTUAL surviving sketch curves (not just our
-    # pre-image) before the scope commits; cancel on any doubt so Revit never
-    # raises the un-ignorable "lines must be in closed loops" crash.
+    # Re-check the ACTUAL surviving boundary before committing the scope;
+    # cancel on any doubt so Revit never raises the un-ignorable
+    # "lines must be in closed loops" crash.
     try:
         survivors = [c for (_e, c) in collect_sketch_curves(sketch)]
     except:
         survivors = kept_curves
-    if not survivors or not curves_closed(survivors, TOL):
+    if not survivors or not boundary_closed(survivors, ref_boundary, TOL):
         scope.Cancel()
-        return False, "post-delete sketch not closed - cancelled safely"
+        return False, "post-delete boundary not closed - cancelled safely"
 
     try:
         scope.Commit(_SwallowFailures())
