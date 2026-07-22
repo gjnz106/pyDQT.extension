@@ -1,7 +1,0 @@
-title: Inquiry
-layout:
-  - HealthCheck
-  - ModelChecker
-  - Warning
-  - Material List
-  - InPlaceModel
